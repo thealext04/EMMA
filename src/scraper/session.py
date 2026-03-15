@@ -105,6 +105,14 @@ class EMMAsession:
         except requests.RequestException as exc:
             logger.warning("Session warm-up failed: %s — proceeding anyway", exc)
 
+        # Required: set the Disclaimer6 cookie to indicate acceptance of MSRB's
+        # public Terms of Use (https://www.msrb.org/terms-of-use). Without this
+        # cookie, EMMA redirects all requests to the Terms of Use page instead of
+        # returning real data. This is the equivalent of clicking "I Agree" on the
+        # disclaimer modal that EMMA presents to first-time visitors.
+        session.cookies.set("Disclaimer6", "msrborg", domain="emma.msrb.org")
+        logger.debug("Set Disclaimer6=msrborg cookie on emma.msrb.org")
+
         return session
 
     def set_json_headers(self) -> None:

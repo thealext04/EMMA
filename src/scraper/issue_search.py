@@ -1,15 +1,22 @@
 """
-issue_search.py — Issue Search API client.
+issue_search.py — Issue Search client.
 
-Discovers bond issues on EMMA by issuer name, state, or bond type.
-Uses the internal JSON API endpoint: GET /api/Search/Issue
+Discovers bond issues on EMMA by borrower/issuer name.
 
-This is the entry point for building the bond universe.
-Given a borrower name, returns a list of matching bond issues — including
-the EMMA issue ID needed for all subsequent calls.
+NOTE: The /api/Search/Issue endpoint returns 404. The correct approach is to
+use the QuickSearch HTML page, which embeds results as inline JavaScript in a
+define("pageData", ...) block. Results are parsed directly from that block —
+there is no separate JSON API needed.
+
+Real endpoint: GET /QuickSearch/Results?quickSearchText={name}&cat=desc
+
+The ISSUER field in results (e.g., "NEW JERSEY EDUCATIONAL FACILITIES AUTHORITY")
+is the conduit issuer, NOT the borrower. The borrower name appears in IssueDesc
+(e.g., "REVENUE BONDS RIDER UNIVERSITY ISSUE 2012 SERIES A"). Callers should
+inspect IssueDesc to confirm the borrower.
 
 Usage:
-    from src.scraper.issue_search import search_issues, search_all_pages
+    from src.scraper.issue_search import search_all_pages, get_issue_ids_for_borrower
     from src.scraper.session import EMMAsession
 
     mgr = EMMAsession()
@@ -18,14 +25,19 @@ Usage:
     results = search_all_pages(session, search_text="Manhattan College")
     for r in results:
         print(r.issue_id, r.issuer_name, r.issue_name)
+
+    issue_ids = get_issue_ids_for_borrower(session, "Rider University")
 """
 
+import json
 import logging
+import re
 from datetime import date
 from typing import Optional
 from urllib.parse import urljoin
 
 import requests
+from bs4 import BeautifulSoup
 
 from src.scraper.cache import cached_get, TTL_SEARCH
 from src.scraper.models import IssuerSearchResult
@@ -34,296 +46,282 @@ from src.scraper.retry import fetch_with_retry
 logger = logging.getLogger(__name__)
 
 EMMA_BASE = "https://emma.msrb.org"
-SEARCH_ISSUE_URL = urljoin(EMMA_BASE, "/api/Search/Issue")
-SEARCH_ISSUER_URL = urljoin(EMMA_BASE, "/api/Search/Issuer")
 
-DEFAULT_PAGE_SIZE = 25
-MAX_PAGES = 40  # 40 × 25 = 1,000 results max per search term
+# Real working endpoint (confirmed via live testing).
+# The old /api/Search/Issue returns 404.
+QUICK_SEARCH_URL = EMMA_BASE + "/QuickSearch/Results"
+
+# EMMA embeds up to ~100 results per QuickSearch page.
+# Pagination is generally not needed, but the constant is kept for documentation.
+RESULTS_PER_PAGE = 100
 
 
 def search_issues(
     session: requests.Session,
     search_text: str,
     state: Optional[str] = None,
-    bond_type: Optional[str] = None,
-    page: int = 1,
-    page_size: int = DEFAULT_PAGE_SIZE,
     use_cache: bool = True,
 ) -> tuple[list[IssuerSearchResult], int]:
     """
-    Query /api/Search/Issue for one page of results.
+    Search EMMA for bond issues matching a borrower or issuer name.
+
+    Fetches /QuickSearch/Results?quickSearchText={search_text}&cat=desc and
+    extracts results from the embedded pageData JavaScript block.
 
     Args:
-        session:     Active requests.Session.
-        search_text: Issuer or bond name to search.
-        state:       Two-letter state code filter (optional).
-        bond_type:   Bond type category filter (optional).
-        page:        1-based page number.
-        page_size:   Results per page (max 25 recommended).
+        session:     Active requests.Session (must have Disclaimer6 cookie set).
+        search_text: Borrower name, issuer name, or keyword to search.
+        state:       Two-letter state code filter (optional). Applied client-side
+                     since the QuickSearch endpoint does not accept a state param.
         use_cache:   Whether to use the response cache.
 
     Returns:
         Tuple of (results list, total_count).
-        total_count is the total matches across all pages.
+        total_count equals len(results) — EMMA embeds all matches in one page.
     """
     params: dict = {
-        "searchText": search_text,
-        "page": page,
-        "pageSize": page_size,
+        "quickSearchText": search_text,
+        "cat": "desc",  # Search bond descriptions (catches conduit borrowers)
     }
-    if state:
-        params["state"] = state.upper()
-    if bond_type:
-        params["category"] = bond_type
-
-    # Build cache key from URL + params
-    cache_bypass = not use_cache
 
     try:
         content = cached_get(
             session,
-            SEARCH_ISSUE_URL,
+            QUICK_SEARCH_URL,
             ttl_hours=TTL_SEARCH,
             params=params,
-            bypass=cache_bypass,
+            bypass=not use_cache,
         )
     except requests.RequestException as exc:
         logger.error("Issue search failed for '%s': %s", search_text, exc)
         return [], 0
 
-    return _parse_issue_search_response(content, search_text)
+    results = _parse_quick_search_page(content, search_text)
+
+    # Apply optional state filter client-side
+    if state:
+        state_upper = state.upper()
+        results = [r for r in results if r.state == state_upper]
+
+    return results, len(results)
 
 
 def search_all_pages(
     session: requests.Session,
     search_text: str,
     state: Optional[str] = None,
-    bond_type: Optional[str] = None,
     use_cache: bool = True,
 ) -> list[IssuerSearchResult]:
     """
-    Paginate through all results for a search query.
+    Return all results for a search query.
 
-    Stops when a page returns fewer results than page_size or
-    when MAX_PAGES is reached (safety limit).
+    EMMA embeds up to ~100 results per QuickSearch page with no pagination
+    API, so a single request is sufficient in most cases. This function is
+    provided for API compatibility and future-proofing.
 
     Returns:
-        Flat list of all IssuerSearchResult across all pages.
+        Flat list of all IssuerSearchResult objects.
     """
-    all_results: list[IssuerSearchResult] = []
-    page = 1
-
-    while page <= MAX_PAGES:
-        results, total_count = search_issues(
-            session,
-            search_text=search_text,
-            state=state,
-            bond_type=bond_type,
-            page=page,
-            use_cache=use_cache,
-        )
-
-        if not results:
-            break
-
-        all_results.extend(results)
-        logger.info(
-            "Search '%s' — page %d: %d results (total reported: %d)",
-            search_text, page, len(results), total_count,
-        )
-
-        # Stop if we've retrieved everything
-        if len(all_results) >= total_count or len(results) < DEFAULT_PAGE_SIZE:
-            break
-
-        page += 1
+    results, total_count = search_issues(
+        session,
+        search_text=search_text,
+        state=state,
+        use_cache=use_cache,
+    )
 
     logger.info(
-        "Search '%s' complete — %d total issues found", search_text, len(all_results)
+        "Search '%s' complete — %d issues found", search_text, len(results)
     )
-    return all_results
-
-
-def search_by_issuer(
-    session: requests.Session,
-    issuer_name: str,
-    use_cache: bool = True,
-) -> list[IssuerSearchResult]:
-    """
-    Search the /api/Search/Issuer endpoint to find all bond issues
-    for a specific issuer entity.
-
-    This is an alternative discovery path when you know the exact issuer name.
-    """
-    params = {"searchText": issuer_name}
-
-    try:
-        content = cached_get(
-            session,
-            SEARCH_ISSUER_URL,
-            ttl_hours=TTL_SEARCH,
-            params=params,
-            bypass=not use_cache,
-        )
-    except requests.RequestException as exc:
-        logger.error("Issuer search failed for '%s': %s", issuer_name, exc)
-        return []
-
-    results, _ = _parse_issue_search_response(content, issuer_name)
     return results
 
 
-# ---------------------------------------------------------------------------
-# Response parsing
-# ---------------------------------------------------------------------------
-
-def _parse_issue_search_response(
-    content: str,
-    search_text: str,
-) -> tuple[list[IssuerSearchResult], int]:
+def get_issue_ids_for_borrower(
+    session: requests.Session,
+    borrower_name: str,
+    use_cache: bool = True,
+) -> list[str]:
     """
-    Parse the JSON response from /api/Search/Issue or /api/Search/Issuer.
+    Convenience function: search for a borrower and return just the issue IDs.
 
-    EMMA's search API returns JSON. The exact schema may vary; this parser
-    is defensive and logs warnings for unexpected shapes rather than crashing.
+    This is the primary entry point for Phase 1 discovery — given a borrower
+    name, returns all EMMA issue IDs that can then be passed to
+    fetch_issue_details() and fetch_disclosure_documents().
+
+    Args:
+        session:       Active requests.Session.
+        borrower_name: Name of the borrower (will appear in bond descriptions).
+        use_cache:     Whether to use the response cache.
 
     Returns:
-        (list of IssuerSearchResult, total_count)
+        List of EMMA issue ID strings (e.g., ["AB12345", "CD67890"]).
     """
-    import json
-
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError as exc:
-        logger.error("Failed to parse search response as JSON: %s", exc)
-        return [], 0
-
-    # EMMA API wraps results in different keys depending on endpoint version.
-    # Try common patterns.
-    hits = (
-        data.get("hits")
-        or data.get("results")
-        or data.get("Issues")
-        or data.get("data")
-        or (data if isinstance(data, list) else [])
+    results = search_all_pages(session, search_text=borrower_name, use_cache=use_cache)
+    issue_ids = [r.issue_id for r in results]
+    logger.info(
+        "get_issue_ids_for_borrower('%s') → %d issue IDs", borrower_name, len(issue_ids)
     )
+    return issue_ids
 
-    total_count = (
-        data.get("totalCount")
-        or data.get("total")
-        or data.get("TotalCount")
-        or len(hits)
-    )
 
-    if not isinstance(hits, list):
+# ---------------------------------------------------------------------------
+# Response parsing — pageData inline JS block
+# ---------------------------------------------------------------------------
+
+def _parse_quick_search_page(
+    html: str,
+    search_text: str,
+) -> list[IssuerSearchResult]:
+    """
+    Parse the /QuickSearch/Results HTML page and extract bond issue results.
+
+    EMMA embeds results in a <script> tag using the AMD define() pattern:
+
+        define("pageData", [], function() {
+            var pdata = {};
+            pdata.Data = {"Status":"data","Messages":[],"Category":"desc","Data":[...]}
+            ...
+        });
+
+    We locate the `pdata.Data = {...}` assignment, parse the JSON value,
+    and extract the inner "Data" array.
+
+    Each item in the Data array has these relevant fields:
+        IssueId     — EMMA internal issue ID (used for all subsequent lookups)
+        IssuerName  — Conduit issuer name (NOT the borrower)
+        IssuerId    — EMMA internal issuer ID
+        IssueDesc   — Bond description string; borrower name appears here
+        State       — Two-letter state code
+        DatedDate   — Bond dated date (MM/DD/YYYY or YYYY-MM-DD)
+        IssueUrl    — Relative URL to the IssueView/Details page
+
+    Returns:
+        List of IssuerSearchResult objects. Empty list if parsing fails.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Find the script tag containing the pageData define() block
+    target_script: Optional[str] = None
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        if "pageData" in text and "pdata.Data" in text:
+            target_script = text
+            break
+
+    if not target_script:
         logger.warning(
-            "Unexpected search response shape for '%s' — could not find results list",
+            "Could not find pageData script block in QuickSearch response for '%s' "
+            "— page may have changed or returned no results",
             search_text,
         )
-        return [], 0
+        return []
+
+    # Extract the JSON object assigned to pdata.Data
+    # Pattern: pdata.Data = {...};   (value may span multiple lines)
+    m = re.search(r"pdata\.Data\s*=\s*(\{.*?\});", target_script, re.DOTALL)
+    if not m:
+        logger.warning(
+            "Found pageData block but could not match pdata.Data assignment for '%s'",
+            search_text,
+        )
+        return []
+
+    try:
+        outer = json.loads(m.group(1))
+    except json.JSONDecodeError as exc:
+        logger.error(
+            "Failed to parse pdata.Data JSON for '%s': %s", search_text, exc
+        )
+        return []
+
+    # Validate response status
+    status = outer.get("Status", "")
+    if status != "data":
+        logger.info(
+            "QuickSearch returned Status='%s' for '%s' — no results",
+            status,
+            search_text,
+        )
+        return []
+
+    items = outer.get("Data")
+    if not isinstance(items, list):
+        logger.warning(
+            "pdata.Data['Data'] is not a list for '%s' — got %s",
+            search_text,
+            type(items).__name__,
+        )
+        return []
 
     results: list[IssuerSearchResult] = []
-    for item in hits:
+    for item in items:
         try:
-            result = _parse_issue_hit(item)
+            result = _parse_page_data_item(item)
             if result:
                 results.append(result)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to parse issue hit: %s — %s", exc, item)
+            logger.warning("Failed to parse pageData item: %s — %s", exc, item)
 
-    return results, int(total_count)
-
-
-def _parse_issue_hit(item: dict) -> Optional[IssuerSearchResult]:
-    """
-    Parse one issue hit from the search results array.
-
-    Field names are case-normalized to handle EMMA's inconsistent casing.
-    """
-    # Normalize keys to lowercase for flexible matching
-    norm = {k.lower(): v for k, v in item.items()}
-
-    issue_id = (
-        norm.get("issueid")
-        or norm.get("id")
-        or norm.get("emma_id")
+    logger.debug(
+        "QuickSearch '%s' — parsed %d results from pageData", search_text, len(results)
     )
+    return results
+
+
+def _parse_page_data_item(item: dict) -> Optional[IssuerSearchResult]:
+    """
+    Parse one bond issue item from the pageData.Data array.
+
+    Field mapping:
+        IssueId    → issue_id
+        IssuerName → issuer_name  (conduit issuer, not the borrower)
+        IssueDesc  → issue_name   (bond description; contains borrower name)
+        State      → state
+        DatedDate  → issue_date
+        IssueUrl   → emma_url (relative; will be made absolute)
+    """
+    issue_id = str(item.get("IssueId") or "").strip()
     if not issue_id:
-        logger.debug("Skipping hit with no issue_id: %s", item)
+        logger.debug("Skipping pageData item with no IssueId: %s", item)
         return None
 
-    issue_id = str(issue_id)
+    issuer_name = str(item.get("IssuerName") or "Unknown Issuer").strip()
+    issue_name = str(item.get("IssueDesc") or "").strip()
+    state = str(item.get("State") or "").strip().upper() or None
 
-    issuer_name = (
-        norm.get("issuername")
-        or norm.get("issuer_name")
-        or norm.get("issuer")
-        or "Unknown Issuer"
-    )
-
-    issue_name = (
-        norm.get("issuename")
-        or norm.get("issue_name")
-        or norm.get("name")
-        or norm.get("description")
-        or ""
-    )
-
-    state = norm.get("state") or norm.get("statecode") or None
-
-    bond_type = (
-        norm.get("bondtype")
-        or norm.get("bond_type")
-        or norm.get("category")
-        or None
-    )
-
-    par_amount: Optional[float] = None
-    for key in ("paramt", "par_amount", "paramount", "originalamount"):
-        raw = norm.get(key)
-        if raw is not None:
-            try:
-                par_amount = float(str(raw).replace(",", ""))
-                break
-            except (ValueError, TypeError):
-                pass
-
+    # Parse DatedDate (may be MM/DD/YYYY or YYYY-MM-DD or absent)
     issue_date: Optional[date] = None
-    for key in ("issuedate", "issue_date", "saledate", "dated_date"):
-        raw = norm.get(key)
-        if raw:
-            try:
-                issue_date = _parse_date(str(raw))
-                if issue_date:
-                    break
-            except ValueError:
-                pass
+    raw_date = str(item.get("DatedDate") or "").strip()
+    if raw_date:
+        issue_date = _parse_date(raw_date)
 
-    emma_url = (
-        norm.get("url")
-        or norm.get("emma_url")
-        or f"https://emma.msrb.org/IssueView/Details/{issue_id}"
-    )
+    # Build absolute URL from relative IssueUrl
+    raw_url = str(item.get("IssueUrl") or "").strip()
+    if raw_url:
+        emma_url = urljoin(EMMA_BASE, raw_url) if not raw_url.startswith("http") else raw_url
+    else:
+        emma_url = f"{EMMA_BASE}/IssueView/Details/{issue_id}"
 
     return IssuerSearchResult(
         issue_id=issue_id,
-        issuer_name=str(issuer_name).strip(),
-        issue_name=str(issue_name).strip(),
-        state=str(state).upper() if state else None,
-        bond_type=str(bond_type).strip() if bond_type else None,
-        par_amount=par_amount,
+        issuer_name=issuer_name,
+        issue_name=issue_name,
+        state=state,
+        bond_type=None,       # Not provided in QuickSearch results
+        par_amount=None,      # Not provided in QuickSearch results
         issue_date=issue_date,
-        emma_url=str(emma_url),
+        emma_url=emma_url,
     )
 
+
+# ---------------------------------------------------------------------------
+# Date utilities
+# ---------------------------------------------------------------------------
 
 def _parse_date(raw: str) -> Optional[date]:
     """
     Parse a date string in various formats EMMA might return.
     Returns None on failure rather than raising.
     """
-    import re
-
     raw = raw.strip()
     if not raw:
         return None
@@ -331,12 +329,18 @@ def _parse_date(raw: str) -> Optional[date]:
     # ISO format: YYYY-MM-DD or YYYY-MM-DDT...
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", raw)
     if m:
-        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
 
     # US format: MM/DD/YYYY
     m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", raw)
     if m:
-        return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+        try:
+            return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+        except ValueError:
+            pass
 
     # Epoch milliseconds (JavaScript timestamps)
     if re.match(r"^\d{10,13}$", raw):
@@ -344,6 +348,9 @@ def _parse_date(raw: str) -> Optional[date]:
         ts = int(raw)
         if ts > 1e10:
             ts //= 1000
-        return datetime.utcfromtimestamp(ts).date()
+        try:
+            return datetime.utcfromtimestamp(ts).date()
+        except (ValueError, OSError):
+            pass
 
     return None

@@ -8,8 +8,20 @@ The system is built in six sequential phases. Each phase delivers standalone val
 
 ## Phase 1 — EMMA Scraping & Discovery Engine
 
-**Status:** Complete ✅
+**Status:** Complete ✅ (endpoints corrected 2026-03-15 based on live testing)
 **Goal:** Build a reliable, respectful scraper that discovers and downloads EMMA disclosures without getting blocked.
+
+### Endpoint Corrections (discovered via live testing, 2026-03-15)
+
+The scaffold was written against assumed EMMA API endpoints. Live testing revealed
+the following corrections, which have been applied to the source files:
+
+| Module | Original (broken) endpoint | Correct endpoint |
+|--------|---------------------------|-----------------|
+| `session.py` | Warm-up GET only | Warm-up GET + must set `Disclaimer6=msrborg` cookie; without it EMMA returns Terms of Use page |
+| `issue_search.py` | `GET /api/Search/Issue` (returns 404) | `GET /QuickSearch/Results?quickSearchText={name}&cat=desc`; results are embedded in inline JS as `pdata.Data = {...}` |
+| `continuing_disclosure.py` | `GET /IssueView/ContinuingDisclosure/{id}` (returns 404) | `GET /IssueView/Details/{id}`; PDF links are `<a href="/*.pdf">` tags in the HTML |
+| `event_notices.py` | `GET /api/Search/EventNotice` | Not yet validated — see module docstring |
 
 ### Deliverables
 
@@ -40,12 +52,12 @@ The system is built in six sequential phases. Each phase delivers standalone val
 | `src/scraper/cache.py` | File-based response caching with TTLs |
 | `src/scraper/storage.py` | Raw PDF storage (data/raw_documents/YYYY/MM/borrower/) |
 | `src/scraper/logger.py` | JSON structured logger with rotating file handler |
-| `src/scraper/issue_search.py` | /api/Search/Issue and /api/Search/Issuer clients |
+| `src/scraper/issue_search.py` | /QuickSearch/Results?cat=desc HTML parser (pdata.Data inline JS) |
 | `src/scraper/issue_details.py` | /IssueView/Details/{id} HTML parser |
-| `src/scraper/continuing_disclosure.py` | /IssueView/ContinuingDisclosure/{id} parser |
+| `src/scraper/continuing_disclosure.py` | /IssueView/Details/{id} PDF link extractor (ContinuingDisclosure endpoint is 404) |
 | `src/scraper/document_queue.py` | JSON-backed download queue (Phase 2 migrates to DB) |
 | `src/scraper/document_fetcher.py` | Queue-based PDF downloader (1–3 workers) |
-| `src/scraper/event_notices.py` | /api/Search/EventNotice client with distress tagging |
+| `src/scraper/event_notices.py` | /api/Search/EventNotice client — NOT yet validated (see module docstring) |
 | `src/scraper/cli.py` | argparse CLI: search, discover, download, events, stats |
 
 ### Key Design Decisions

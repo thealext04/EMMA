@@ -1,15 +1,32 @@
 """
 continuing_disclosure.py — Continuing Disclosure document list fetcher.
 
-Fetches /IssueView/ContinuingDisclosure/{issueId} and returns all
-disclosure documents for a bond issue.
+NOTE: The /IssueView/ContinuingDisclosure/{issueId} endpoint returns 404.
+The correct approach is to fetch /IssueView/Details/{issueId} (the same page
+used by issue_details.py) and extract all PDF <a> links from the HTML.
+All disclosure documents — financial filings and event notices — are embedded
+directly in that page as relative PDF links.
 
 This is the core monitoring endpoint — called daily for watchlist borrowers.
 
 Key features:
-  - Incremental update: stops parsing when a document is older than last_seen_date
-  - Handles both JSON API responses and HTML-rendered pages
-  - Returns structured DisclosureDocument objects
+  - Incremental update: stops collecting documents posted on or before
+    last_seen_date (using doc_date as a proxy since HTML has no explicit
+    posted_date)
+  - Skips "(Archived)" links (superseded document versions)
+  - Parses doc_type and doc_date from link text
+  - Generates a stable doc_id from the PDF filename
+
+PDF link text examples observed on EMMA:
+  "Financial Operating Filing (323 KB)"
+  "Event Filing as of 01/21/2026 (111 KB)"
+  "Event Filing dated 11/20/2020 (332 KB)"
+
+PDF URL format examples:
+  /P22014304-P21534633-P21991287.pdf   (current 3-part format)
+  /RE1375171-RE1067927-RE1477956.pdf   (older RE-prefix format)
+  /SS1393115-SS1083841-SS1491874.pdf   (older SS-prefix format)
+  /ER1323887-ER1031755-ER1438880.pdf   (older ER-prefix format)
 
 Usage:
     from src.scraper.continuing_disclosure import fetch_disclosure_documents
@@ -22,7 +39,6 @@ Usage:
     )
 """
 
-import json
 import logging
 import re
 from datetime import date, datetime
@@ -34,12 +50,14 @@ from bs4 import BeautifulSoup
 
 from src.scraper.cache import cached_get, TTL_CONTINUING_DISCLOSURE
 from src.scraper.models import DisclosureDocument
-from src.scraper.retry import fetch_with_retry
 
 logger = logging.getLogger(__name__)
 
 EMMA_BASE = "https://emma.msrb.org"
-DISCLOSURE_URL = EMMA_BASE + "/IssueView/ContinuingDisclosure/{issue_id}"
+
+# Real working endpoint: the Issue Details page embeds all disclosure PDF links.
+# /IssueView/ContinuingDisclosure/{issueId} returns 404 — do not use it.
+ISSUE_DETAILS_URL = EMMA_BASE + "/IssueView/Details/{issue_id}"
 
 # Known high-signal document types that trigger immediate distress review
 HIGH_SIGNAL_TYPES = {
@@ -64,11 +82,17 @@ def fetch_disclosure_documents(
     """
     Fetch all (or new) continuing disclosure documents for a bond issue.
 
+    Fetches /IssueView/Details/{issueId} and extracts all PDF <a> links
+    embedded in the page. Archived (superseded) documents are skipped.
+
     Args:
-        session:        Active requests.Session.
+        session:        Active requests.Session (must have Disclaimer6 cookie set).
         issue_id:       EMMA internal issue ID.
-        last_seen_date: If provided, stop collecting documents posted on or
-                        before this date. This implements incremental updates.
+        last_seen_date: If provided, stop collecting documents whose doc_date is
+                        on or before this date. This implements incremental updates.
+                        Note: EMMA's Details page does not expose an explicit
+                        posted_date in the HTML, so doc_date (parsed from the
+                        link text) is used as a proxy.
         use_cache:      Whether to use the 24-hour response cache.
                         Set to False for real-time monitoring runs.
 
@@ -76,10 +100,10 @@ def fetch_disclosure_documents(
         List of DisclosureDocument objects, newest first.
         If last_seen_date is provided, only documents newer than that date.
     """
-    url = DISCLOSURE_URL.format(issue_id=issue_id)
+    url = ISSUE_DETAILS_URL.format(issue_id=issue_id)
 
     try:
-        content = cached_get(
+        html = cached_get(
             session,
             url,
             ttl_hours=TTL_CONTINUING_DISCLOSURE,
@@ -89,19 +113,21 @@ def fetch_disclosure_documents(
         logger.error("Failed to fetch disclosure list for issue %s: %s", issue_id, exc)
         return []
 
-    # Try JSON parse first, then fall back to HTML
-    docs = _try_parse_as_json(content, issue_id)
-    if docs is None:
-        docs = _parse_html_disclosure_page(content, issue_id)
+    docs = _extract_pdf_links(html, issue_id)
 
-    # Apply incremental filter
+    # Apply incremental filter using doc_date as posted_date proxy
     if last_seen_date is not None:
         new_docs: list[DisclosureDocument] = []
         for doc in docs:
-            if doc.posted_date and doc.posted_date <= last_seen_date:
+            # Use posted_date if set; fall back to doc_date converted to datetime
+            comparison_dt: Optional[datetime] = doc.posted_date
+            if comparison_dt is None and doc.doc_date is not None:
+                comparison_dt = datetime(doc.doc_date.year, doc.doc_date.month, doc.doc_date.day)
+
+            if comparison_dt is not None and comparison_dt <= last_seen_date:
                 logger.debug(
                     "Incremental stop at %s (last_seen: %s) for issue %s",
-                    doc.posted_date,
+                    comparison_dt,
                     last_seen_date,
                     issue_id,
                 )
@@ -121,283 +147,160 @@ def fetch_disclosure_documents(
 def get_latest_posted_date(docs: list[DisclosureDocument]) -> Optional[datetime]:
     """
     Return the most recent posted_date from a list of documents.
+
+    Since the Details page does not expose a true posted_date, this returns
+    the most recent doc_date converted to datetime (used as a proxy cursor).
+
     Use this to update the last_seen_date cursor after a successful fetch.
     """
-    dated = [d.posted_date for d in docs if d.posted_date is not None]
-    return max(dated) if dated else None
+    # Prefer explicit posted_date; fall back to doc_date
+    candidates: list[datetime] = []
+    for d in docs:
+        if d.posted_date is not None:
+            candidates.append(d.posted_date)
+        elif d.doc_date is not None:
+            candidates.append(datetime(d.doc_date.year, d.doc_date.month, d.doc_date.day))
+    return max(candidates) if candidates else None
 
 
 # ---------------------------------------------------------------------------
-# Parsers
+# PDF link extraction from /IssueView/Details HTML
 # ---------------------------------------------------------------------------
 
-def _try_parse_as_json(
-    content: str,
-    issue_id: str,
-) -> Optional[list[DisclosureDocument]]:
+def _extract_pdf_links(html: str, issue_id: str) -> list[DisclosureDocument]:
     """
-    Attempt to parse the response as JSON.
-    Returns None if content is not valid JSON (signals HTML fallback needed).
-    """
-    stripped = content.strip()
-    if not stripped.startswith(("{", "[")):
-        return None
+    Extract all disclosure document PDF links from an /IssueView/Details page.
 
-    try:
-        data = json.loads(stripped)
-    except json.JSONDecodeError:
-        return None
+    EMMA embeds PDF links as <a href="/Pxxx-Pyyy-Pzzz.pdf">Link Text</a>.
+    The link text encodes both the document type and the document date.
 
-    # Normalize to a list of items
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        items = (
-            data.get("documents")
-            or data.get("filings")
-            or data.get("results")
-            or data.get("hits")
-            or data.get("data")
-            or []
-        )
-    else:
-        return None
+    Links containing "(Archived)" in their text are skipped — these are
+    superseded versions of documents that have been replaced by later filings.
 
-    docs: list[DisclosureDocument] = []
-    for item in items:
-        if isinstance(item, dict):
-            doc = _parse_json_document(item, issue_id)
-            if doc:
-                docs.append(doc)
-
-    # Sort newest first by posted_date
-    docs.sort(key=lambda d: d.posted_date or datetime.min, reverse=True)
-    return docs
-
-
-def _parse_json_document(item: dict, issue_id: str) -> Optional[DisclosureDocument]:
-    """Parse one document from the JSON response."""
-    norm = {k.lower(): v for k, v in item.items()}
-
-    doc_id = (
-        str(norm.get("documentid") or norm.get("docid") or norm.get("id") or "")
-    )
-    if not doc_id:
-        return None
-
-    doc_url = (
-        norm.get("url")
-        or norm.get("documenturl")
-        or norm.get("docurl")
-        or norm.get("downloadurl")
-    )
-    if not doc_url:
-        # Construct from doc_id if possible
-        doc_url = f"{EMMA_BASE}/FileViewer/ViewFile/{doc_id}"
-
-    if not str(doc_url).startswith("http"):
-        doc_url = urljoin(EMMA_BASE, str(doc_url))
-
-    doc_type = (
-        norm.get("documenttype")
-        or norm.get("doctype")
-        or norm.get("type")
-        or norm.get("category")
-        or "Unknown"
-    )
-
-    title = (
-        norm.get("title")
-        or norm.get("description")
-        or norm.get("name")
-        or str(doc_type)
-    )
-
-    doc_date = _parse_date(str(norm.get("documentdate") or norm.get("docdate") or ""))
-    posted_date = _parse_datetime(str(norm.get("posteddate") or norm.get("createdate") or ""))
-
-    submitter = norm.get("submitter") or norm.get("submittername") or None
-
-    return DisclosureDocument(
-        doc_id=doc_id,
-        issue_id=issue_id,
-        doc_type=str(doc_type).strip(),
-        doc_date=doc_date,
-        posted_date=posted_date,
-        title=str(title).strip(),
-        doc_url=str(doc_url),
-        submitter=str(submitter).strip() if submitter else None,
-    )
-
-
-def _parse_html_disclosure_page(
-    html: str,
-    issue_id: str,
-) -> list[DisclosureDocument]:
-    """
-    Parse the HTML-rendered continuing disclosure page.
-
-    EMMA renders disclosure documents in a table. Each row contains:
-    - Document type
-    - Document date
-    - Posted date
-    - Title / description (often a link to the PDF)
-    - Submitter name
+    Results are sorted newest first by doc_date (None-dated docs go last).
     """
     soup = BeautifulSoup(html, "html.parser")
+
+    # Find all <a> tags whose href ends in .pdf (case-insensitive)
+    pdf_links = soup.find_all("a", href=re.compile(r"\.pdf$", re.I))
+
     docs: list[DisclosureDocument] = []
+    seen_doc_ids: set[str] = set()
 
-    # Find disclosure document tables
-    # EMMA typically uses a table with class containing "disclosure" or specific IDs
-    doc_tables = _find_disclosure_tables(soup)
+    for link in pdf_links:
+        href = link.get("href", "")
+        link_text = link.get_text(strip=True)
 
-    if not doc_tables:
-        logger.warning(
-            "No disclosure document table found for issue %s — HTML may have changed",
-            issue_id,
-        )
-        return []
-
-    for table in doc_tables:
-        rows = table.find_all("tr")
-        if not rows:
+        # Skip archived (superseded) documents
+        if "(Archived)" in link_text or "(archived)" in link_text:
+            logger.debug("Skipping archived document: %s", link_text)
             continue
 
-        # Detect column positions from header row
-        col_map = _detect_columns(rows[0])
+        # Make URL absolute
+        if not href.startswith("http"):
+            doc_url = urljoin(EMMA_BASE, href)
+        else:
+            doc_url = href
 
-        for row in rows[1:]:  # Skip header
-            cells = row.find_all(["td", "th"])
-            if not cells or len(cells) < 2:
-                continue
+        # Derive a stable doc_id from the PDF filename (e.g., "P22014304-P21534633-P21991287")
+        filename_match = re.search(r"/([^/]+)\.pdf$", href, re.I)
+        if filename_match:
+            doc_id = filename_match.group(1)
+        else:
+            # Fallback: hash the URL for a stable ID
+            import hashlib
+            doc_id = hashlib.md5(doc_url.encode()).hexdigest()[:16]
 
-            doc = _parse_html_row(cells, col_map, issue_id)
-            if doc:
-                docs.append(doc)
+        # Deduplicate by doc_id
+        if doc_id in seen_doc_ids:
+            continue
+        seen_doc_ids.add(doc_id)
 
-    # Sort newest first
-    docs.sort(key=lambda d: d.posted_date or datetime.min, reverse=True)
+        doc_type = _classify_doc_type(link_text)
+        doc_date = _extract_doc_date(link_text)
+
+        docs.append(DisclosureDocument(
+            doc_id=doc_id,
+            issue_id=issue_id,
+            doc_type=doc_type,
+            doc_date=doc_date,
+            # The Details page HTML does not expose a separate posted_date.
+            # doc_date (from link text) is used as the incremental cursor proxy.
+            posted_date=None,
+            title=link_text,
+            doc_url=doc_url,
+            submitter=None,
+        ))
+
+    # Sort newest first: docs with doc_date before docs without, then by date desc
+    docs.sort(
+        key=lambda d: d.doc_date or date.min,
+        reverse=True,
+    )
 
     logger.debug(
-        "HTML parser found %d documents for issue %s", len(docs), issue_id
+        "Extracted %d PDF disclosure links for issue %s", len(docs), issue_id
     )
     return docs
 
 
-def _find_disclosure_tables(soup: BeautifulSoup) -> list:
+def _classify_doc_type(link_text: str) -> str:
     """
-    Locate the document listing table(s) on the disclosure page.
-    Tries multiple selector strategies.
+    Determine the document type from the PDF link text.
+
+    EMMA link text patterns observed:
+        "Financial Operating Filing (323 KB)"      → "Financial Operating Filing"
+        "Event Filing as of 01/21/2026 (111 KB)"  → "Event Filing"
+        "Event Filing dated 11/20/2020 (332 KB)"  → "Event Filing"
+        "Annual Report (456 KB)"                   → "Annual Report"
+
+    Falls back to "Other" if no known pattern matches.
     """
-    # Strategy 1: table with ID or class containing "disclosure" or "document"
-    for selector in [
-        "table.disclosure-table",
-        "table#disclosureDocuments",
-        "table.continuing-disclosure",
-        "table[id*='document']",
-        "table[class*='document']",
-        "table[class*='filing']",
-    ]:
-        found = soup.select(selector)
-        if found:
-            return found
+    text_lower = link_text.lower()
 
-    # Strategy 2: any table that contains PDF links
-    tables_with_pdfs = []
-    for table in soup.find_all("table"):
-        if table.find("a", href=re.compile(r"\.(pdf|PDF)", re.I)):
-            tables_with_pdfs.append(table)
-    if tables_with_pdfs:
-        return tables_with_pdfs
+    if "financial operating" in text_lower:
+        return "Financial Operating Filing"
+    if "event filing" in text_lower or "event notice" in text_lower:
+        return "Event Filing"
+    if "annual report" in text_lower:
+        return "Annual Report"
+    if "audited" in text_lower or "audit" in text_lower:
+        return "Audited Financial Statement"
+    if "budget" in text_lower:
+        return "Budget Filing"
+    if "rating" in text_lower:
+        return "Rating Notice"
+    if "material" in text_lower:
+        return "Material Event Notice"
 
-    # Strategy 3: largest table on the page (last resort)
-    all_tables = soup.find_all("table")
-    if all_tables:
-        largest = max(all_tables, key=lambda t: len(t.find_all("tr")))
-        if len(largest.find_all("tr")) > 2:
-            return [largest]
-
-    return []
+    # Strip file size suffix (e.g., " (323 KB)") and use as-is if something remains
+    clean = re.sub(r"\s*\(\d+\s*KB\)\s*$", "", link_text, flags=re.I).strip()
+    # Strip date suffixes from the cleaned text
+    clean = re.sub(r"\s+(?:as of|dated)\s+\d{1,2}/\d{1,2}/\d{4}", "", clean, flags=re.I).strip()
+    return clean or "Other"
 
 
-def _detect_columns(header_row) -> dict[str, int]:
+def _extract_doc_date(link_text: str) -> Optional[date]:
     """
-    Detect column positions from the table header row.
-    Returns a dict mapping logical name → column index.
+    Extract a document date from PDF link text.
+
+    EMMA link text contains date strings in these formats:
+        "Event Filing as of 01/21/2026 (111 KB)"   → date(2026, 1, 21)
+        "Event Filing dated 11/20/2020 (332 KB)"   → date(2020, 11, 20)
+
+    Returns None if no date pattern is found.
     """
-    col_map: dict[str, int] = {}
-    headers = [th.get_text(strip=True).lower() for th in header_row.find_all(["th", "td"])]
+    # Pattern: "as of MM/DD/YYYY" or "dated MM/DD/YYYY"
+    m = re.search(r"(?:as of|dated)\s+(\d{1,2}/\d{1,2}/\d{4})", link_text, re.I)
+    if m:
+        return _parse_date(m.group(1))
 
-    for i, h in enumerate(headers):
-        if any(k in h for k in ["type", "category", "kind"]):
-            col_map.setdefault("doc_type", i)
-        elif any(k in h for k in ["document date", "doc date", "filing date", "report date"]):
-            col_map.setdefault("doc_date", i)
-        elif any(k in h for k in ["posted", "received", "upload"]):
-            col_map.setdefault("posted_date", i)
-        elif any(k in h for k in ["description", "title", "document", "filing"]):
-            col_map.setdefault("title", i)
-        elif any(k in h for k in ["submitter", "filer", "submitted by"]):
-            col_map.setdefault("submitter", i)
+    # Fallback: any bare MM/DD/YYYY in the text
+    m = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", link_text)
+    if m:
+        return _parse_date(m.group(1))
 
-    return col_map
-
-
-def _parse_html_row(
-    cells: list,
-    col_map: dict[str, int],
-    issue_id: str,
-) -> Optional[DisclosureDocument]:
-    """Parse one table row into a DisclosureDocument."""
-    def cell_text(idx: int) -> str:
-        if idx < len(cells):
-            return cells[idx].get_text(strip=True)
-        return ""
-
-    # Extract PDF link and doc_id from any cell
-    doc_url = None
-    doc_id = None
-    for cell in cells:
-        link = cell.find("a", href=True)
-        if link:
-            href = link["href"]
-            if not href.startswith("http"):
-                href = urljoin(EMMA_BASE, href)
-            doc_url = href
-            # Extract doc ID from URL
-            m = re.search(r"/([A-Za-z0-9_-]{6,})\.(pdf|PDF)$", href)
-            if not m:
-                m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", href)
-            if not m:
-                m = re.search(r"/ViewFile/([A-Za-z0-9_-]+)", href)
-            if m:
-                doc_id = m.group(1)
-            break
-
-    if not doc_url:
-        return None
-
-    if not doc_id:
-        # Generate a stable ID from the URL
-        import hashlib
-        doc_id = hashlib.md5(doc_url.encode()).hexdigest()[:12]
-
-    doc_type_text = cell_text(col_map.get("doc_type", 0))
-    doc_date = _parse_date(cell_text(col_map.get("doc_date", 1)))
-    posted_date = _parse_datetime(cell_text(col_map.get("posted_date", 2)))
-    title = cell_text(col_map.get("title", 3)) or doc_type_text
-    submitter = cell_text(col_map.get("submitter", 4)) or None
-
-    return DisclosureDocument(
-        doc_id=doc_id,
-        issue_id=issue_id,
-        doc_type=doc_type_text or "Unknown",
-        doc_date=doc_date,
-        posted_date=posted_date,
-        title=title,
-        doc_url=doc_url,
-        submitter=submitter,
-    )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +313,7 @@ def _parse_date(raw: str) -> Optional[date]:
     if not raw:
         return None
 
+    # ISO: YYYY-MM-DD
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", raw)
     if m:
         try:
@@ -417,6 +321,7 @@ def _parse_date(raw: str) -> Optional[date]:
         except ValueError:
             pass
 
+    # US: MM/DD/YYYY
     m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", raw)
     if m:
         try:
@@ -445,15 +350,5 @@ def _parse_datetime(raw: str) -> Optional[datetime]:
     d = _parse_date(raw)
     if d:
         return datetime(d.year, d.month, d.day)
-
-    # Epoch milliseconds
-    if re.match(r"^\d{10,13}$", raw):
-        ts = int(raw)
-        if ts > 1e10:
-            ts //= 1000
-        try:
-            return datetime.utcfromtimestamp(ts)
-        except (ValueError, OSError):
-            pass
 
     return None

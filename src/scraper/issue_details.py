@@ -13,6 +13,16 @@ Fetches /IssueView/Details/{issueId} and extracts:
 
 This is where the borrower → issuer → CUSIP hierarchy is established.
 
+NOTE on session requirements: The session must have the Disclaimer6=msrborg
+cookie set on emma.msrb.org (handled automatically by EMMAsession._create_session).
+Without it, EMMA redirects to the Terms of Use page instead of the Details page.
+
+NOTE on the continuing_disclosure_url field: The /IssueView/ContinuingDisclosure/
+endpoint returns 404. Disclosure documents are instead extracted directly from
+this same /IssueView/Details/ page by continuing_disclosure.py. The
+continuing_disclosure_url field in BondIssueDetail is kept for compatibility but
+callers should use fetch_disclosure_documents(session, issue_id) directly.
+
 Usage:
     from src.scraper.issue_details import fetch_issue_details
     detail = fetch_issue_details(session, issue_id="ABC123")
@@ -386,6 +396,12 @@ def _extract_from_html_table(
     """
     Search for a label in the page and return the adjacent value cell.
     Handles both single string and list of fallback labels.
+
+    Also checks breadcrumb navigation links for issuer name. On EMMA's
+    /IssueView/Details pages, the breadcrumb takes the form:
+        Home > Issuers By State > Georgia > Issuer Homepage > Issue Details
+    where "Issuer Homepage" is a link whose text is the issuer name. When
+    searching for "Issuer", this breadcrumb link is used as a fallback.
     """
     if isinstance(labels, str):
         labels = [labels]
@@ -412,6 +428,20 @@ def _extract_from_html_table(
                 val = next_row.get_text(strip=True)
                 if val:
                     return val
+
+    # Breadcrumb fallback: look for "Issuer Homepage" link text, whose href
+    # points to the issuer page. The link text itself is the issuer name.
+    # This covers the common EMMA pattern:
+    #   <a href="/IssuerHomePage/...">ISSUER NAME HERE</a>
+    if any(
+        re.search(r"issuer", lbl, re.I)
+        for lbl in (labels if isinstance(labels, list) else [labels])
+    ):
+        issuer_link = soup.find("a", href=re.compile(r"/IssuerHomePage/", re.I))
+        if issuer_link:
+            val = issuer_link.get_text(strip=True)
+            if val:
+                return val
 
     return None
 

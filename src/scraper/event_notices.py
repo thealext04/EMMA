@@ -9,6 +9,13 @@ This is used by both:
 Material event notices are the highest-signal distress indicators in EMMA.
 Examples: covenant violations, rating changes, payment defaults, bankruptcies.
 
+NOTE: The /api/Search/EventNotice endpoint has NOT been validated via live
+testing as of 2026-03-15. It may return 404 or require different parameters,
+similar to how /api/Search/Issue was found to return 404. Before relying on
+this module in production, verify the endpoint manually and update the
+implementation if needed (e.g., by scraping the HTML search results page
+rather than expecting a JSON API response).
+
 Usage:
     from src.scraper.event_notices import fetch_event_notices, HIGH_SIGNAL_TYPES
 
