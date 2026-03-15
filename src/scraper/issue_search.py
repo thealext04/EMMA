@@ -3,12 +3,19 @@ issue_search.py — Issue Search client.
 
 Discovers bond issues on EMMA by borrower/issuer name.
 
-NOTE: The /api/Search/Issue endpoint returns 404. The correct approach is to
-use the QuickSearch HTML page, which embeds results as inline JavaScript in a
-define("pageData", ...) block. Results are parsed directly from that block —
-there is no separate JSON API needed.
+Two search paths are available:
 
-Real endpoint: GET /QuickSearch/Results?quickSearchText={name}&cat=desc
+1. **Advanced Search** (preferred) — POST /AdvancedSearch/Search.aspx/GetSearchResult
+   Discovered by reverse-engineering EMMA's advSearchPage.js (RequireJS module).
+   Supports native EMMA maturity/call filtering via:
+       IncludeMaturedSecurities:    false → EMMA excludes fully matured bonds
+       IncludeFullyCalledSecurities: false → EMMA excludes fully called/redeemed bonds
+   This is the authoritative filter — it uses EMMA's own data, not an age heuristic.
+   Search field: IssueDescription (matches borrower name in bond description text).
+
+2. **QuickSearch** (fallback) — GET /QuickSearch/Results?quickSearchText={name}&cat=desc
+   Embeds results as inline JavaScript in a define("pageData", ...) block.
+   No native maturity filtering — borrower_search applies the age heuristic instead.
 
 The ISSUER field in results (e.g., "NEW JERSEY EDUCATIONAL FACILITIES AUTHORITY")
 is the conduit issuer, NOT the borrower. The borrower name appears in IssueDesc
@@ -16,12 +23,16 @@ is the conduit issuer, NOT the borrower. The borrower name appears in IssueDesc
 inspect IssueDesc to confirm the borrower.
 
 Usage:
-    from src.scraper.issue_search import search_all_pages, get_issue_ids_for_borrower
+    from src.scraper.issue_search import advanced_search_issues, search_all_pages
     from src.scraper.session import EMMAsession
 
     mgr = EMMAsession()
     session = mgr.get_session()
 
+    # Preferred — uses EMMA's native maturity filter:
+    results, count = advanced_search_issues(session, issue_description="Rider University")
+
+    # Fallback — QuickSearch (no native maturity filter):
     results = search_all_pages(session, search_text="Manhattan College")
     for r in results:
         print(r.issue_id, r.issuer_name, r.issue_name)
@@ -47,13 +58,282 @@ logger = logging.getLogger(__name__)
 
 EMMA_BASE = "https://emma.msrb.org"
 
-# Real working endpoint (confirmed via live testing).
+# Advanced Search endpoint — discovered via EMMA's advSearchPage.js (RequireJS).
+# Accepts a JSON POST with a searchCriteriaForm object.
+# Natively supports maturity and call filtering via IncludeMaturedSecurities /
+# IncludeFullyCalledSecurities boolean fields.
+ADVANCED_SEARCH_URL = EMMA_BASE + "/AdvancedSearch/Search.aspx/GetSearchResult"
+
+# QuickSearch fallback endpoint (confirmed working).
 # The old /api/Search/Issue returns 404.
 QUICK_SEARCH_URL = EMMA_BASE + "/QuickSearch/Results"
 
 # EMMA embeds up to ~100 results per QuickSearch page.
 # Pagination is generally not needed, but the constant is kept for documentation.
 RESULTS_PER_PAGE = 100
+
+# Headers for the Advanced Search JSON endpoint.
+# Mimics jQuery $.ajax call with contentType: "application/json; charset=utf-8".
+_ADV_SEARCH_HEADERS = {
+    "Content-Type": "application/json; charset=utf-8",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": EMMA_BASE + "/AdvancedSearch/Search.aspx",
+}
+
+
+def advanced_search_issues(
+    session: requests.Session,
+    issue_description: str,
+    state: Optional[str] = None,
+    include_matured: bool = False,
+    include_fully_called: bool = False,
+) -> tuple[list[IssuerSearchResult], int]:
+    """
+    Search EMMA via the Advanced Search endpoint with native maturity filtering.
+
+    POSTs to /AdvancedSearch/Search.aspx/GetSearchResult with a JSON body
+    mirroring the form fields from EMMA's advSearchPage.js.
+
+    Setting include_matured=False and include_fully_called=False (the defaults)
+    tells EMMA to exclude bonds whose entire maturity schedule has passed and bonds
+    that have been fully called or redeemed — the equivalent of leaving those two
+    checkboxes UNCHECKED on the EMMA Advanced Search form.
+
+    This is the authoritative filter — EMMA uses its own CUSIP-level maturity data,
+    not the age heuristic used by QuickSearch borrower_search.
+
+    Args:
+        session:              Active requests.Session (Disclaimer6 cookie must be set).
+        issue_description:    Borrower name or keyword searched against bond descriptions.
+        state:                Optional two-letter state filter.
+        include_matured:      If True, include fully matured bond issues (default False).
+        include_fully_called: If True, include fully called/redeemed issues (default False).
+
+    Returns:
+        Tuple of (results list, total_count). Returns ([], 0) on any error.
+
+    Response structure (double-JSON-encoded by ASP.NET ScriptService):
+        POST → {"d": "<json string>"}
+                        ↓ json.loads
+               {"data": "<json string>", ...}
+                        ↓ json.loads
+               {"Issues": [...], "Securities": [...], "Trades": [...], "CDDocuments": [...]}
+    """
+    search_criteria = _build_adv_search_criteria(
+        issue_description=issue_description,
+        state=state,
+        include_matured=include_matured,
+        include_fully_called=include_fully_called,
+    )
+    payload = json.dumps({"searchCriteriaForm": search_criteria})
+
+    logger.debug(
+        "Advanced Search POST: IssueDescription='%s' state=%s matured=%s called=%s",
+        issue_description,
+        state,
+        include_matured,
+        include_fully_called,
+    )
+
+    try:
+        resp = session.post(
+            ADVANCED_SEARCH_URL,
+            data=payload,
+            headers=_ADV_SEARCH_HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        logger.error("Advanced Search request failed for '%s': %s", issue_description, exc)
+        return [], 0
+
+    try:
+        outer = resp.json()                       # {"d": "<json string>"}
+        mid = json.loads(outer["d"])              # {"data": "<json string>", ...}
+        inner = json.loads(mid["data"])           # {"Issues": [...], ...}
+    except (KeyError, json.JSONDecodeError, ValueError) as exc:
+        logger.error(
+            "Failed to parse Advanced Search response for '%s': %s — raw: %.200s",
+            issue_description,
+            exc,
+            resp.text,
+        )
+        return [], 0
+
+    # Check for EMMA-level error messages embedded in the payload
+    if isinstance(inner, str) and "ValidationMessage" in inner:
+        logger.warning("Advanced Search returned validation error for '%s'", issue_description)
+        return [], 0
+
+    issues_raw = inner.get("Issues")
+    if not isinstance(issues_raw, list):
+        logger.warning(
+            "Advanced Search Issues field is not a list for '%s' — got %s. "
+            "Full keys: %s",
+            issue_description,
+            type(issues_raw).__name__,
+            list(inner.keys()) if isinstance(inner, dict) else "N/A",
+        )
+        return [], 0
+
+    results: list[IssuerSearchResult] = []
+    for item in issues_raw:
+        try:
+            result = _parse_adv_search_issue_item(item)
+            if result:
+                results.append(result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to parse Advanced Search issue item: %s — %s", exc, item)
+
+    logger.debug(
+        "Advanced Search '%s' — parsed %d issues (matured=%s, called=%s)",
+        issue_description,
+        len(results),
+        include_matured,
+        include_fully_called,
+    )
+    return results, len(results)
+
+
+def _build_adv_search_criteria(
+    issue_description: str,
+    state: Optional[str],
+    include_matured: bool,
+    include_fully_called: bool,
+) -> dict:
+    """
+    Build the searchCriteriaForm dict sent to GetSearchResult.
+
+    All unused filter fields are set to empty string or False/[] so EMMA
+    treats them as "no filter".  Only IssueDescription, State, and the two
+    maturity/call flags carry meaningful values for borrower searches.
+    """
+    return {
+        "SecurityType": "ALL",
+        "Cusip": "",
+        "State": state.upper() if state else "",
+        "IssuerName": "",
+        "IssueDescription": issue_description,
+        "IncludeMaturedSecurities": include_matured,
+        "IncludeFullyCalledSecurities": include_fully_called,
+        "MaturityDateBegin": "",
+        "MaturityDateEnd": "",
+        "ClosingDateBegin": "",
+        "ClosingDateEnd": "",
+        "PostingDateBegin": "",
+        "PostingDateEnd": "",
+        "DatedDateBegin": "",
+        "DatedDateEnd": "",
+        "InterestRateBegin": "",
+        "InterestRateEnd": "",
+        "Purpose": "",
+        "SecuredBy": "",
+        "RateType": "",
+        "Insured": "",
+        "Taxable": "",
+        "Callable": "",
+        "CallDateBegin": "",
+        "CallDateEnd": "",
+        "CallPriceBegin": "",
+        "CallPriceEnd": "",
+        "CusipGroupId": "",
+        "FitchOperator": "",
+        "FitchRatingCode": "",
+        "SNPOperator": "",
+        "SNPRatingCode": "",
+        "KrollOperator": "",
+        "KrollRatingCode": "",
+        "MoodysOperator": "",
+        "MoodysRatingCode": "",
+        "PMDisclosure": False,
+        "ARDisclosure": False,
+        "ShortDisclosure": False,
+        "EventDisclosures": [],
+        "FinancialDisclosures": [],
+        "ABSDisclosureTypes": [],
+        "BLDisclosures": False,
+        "TradeDateBegin": "",
+        "TradeDateEnd": "",
+        "TradePriceBegin": "",
+        "TradePriceEnd": "",
+        "TradeYieldBegin": "",
+        "TradeYieldEnd": "",
+        "TradeAmountBegin": "",
+        "TradeAmountEnd": "",
+        "TradeType": "",
+        "TradeSpecialCondition": "",
+        "SetCDTabDefault": False,
+    }
+
+
+def _parse_adv_search_issue_item(item: dict) -> Optional["IssuerSearchResult"]:
+    """
+    Parse one bond issue item from the Advanced Search Issues array.
+
+    EMMA's Advanced Search issues response uses the same field names as
+    QuickSearch pageData items.  If the schema diverges, warnings are logged
+    and None is returned for unrecognisable items.
+
+    Known field candidates (in priority order for each logical field):
+        issue_id:    IssueId
+        issuer_name: IssuerName
+        issue_name:  IssueDesc, IssueDescription, Description
+        state:       State
+        issue_date:  DatedDate, IssueDate, ClosingDate
+        emma_url:    IssueUrl, IssueURL, Url
+    """
+    # --- issue_id (required) ---
+    issue_id = str(
+        item.get("IssueId") or item.get("IssueID") or ""
+    ).strip()
+    if not issue_id:
+        logger.debug("Skipping Advanced Search item with no IssueId: %s", item)
+        return None
+
+    issuer_name = str(
+        item.get("IssuerName") or item.get("Issuer") or "Unknown Issuer"
+    ).strip()
+
+    issue_name = str(
+        item.get("IssueDesc") or item.get("IssueDescription")
+        or item.get("Description") or ""
+    ).strip()
+
+    state = str(item.get("State") or "").strip().upper() or None
+
+    # Parse date — try multiple field names
+    issue_date: Optional[date] = None
+    for date_field in ("DatedDate", "IssueDate", "ClosingDate"):
+        raw_date = str(item.get(date_field) or "").strip()
+        if raw_date:
+            issue_date = _parse_date(raw_date)
+            if issue_date:
+                break
+
+    # Build URL
+    raw_url = str(
+        item.get("IssueUrl") or item.get("IssueURL") or item.get("Url") or ""
+    ).strip()
+    if raw_url:
+        emma_url = (
+            urljoin(EMMA_BASE, raw_url)
+            if not raw_url.startswith("http")
+            else raw_url
+        )
+    else:
+        emma_url = f"{EMMA_BASE}/IssueView/Details/{issue_id}"
+
+    return IssuerSearchResult(
+        issue_id=issue_id,
+        issuer_name=issuer_name,
+        issue_name=issue_name,
+        state=state,
+        bond_type=None,
+        par_amount=None,
+        issue_date=issue_date,
+        emma_url=emma_url,
+    )
 
 
 def search_issues(

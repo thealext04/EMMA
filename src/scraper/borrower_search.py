@@ -40,7 +40,7 @@ from typing import Optional
 
 import requests
 
-from src.scraper.issue_search import search_issues
+from src.scraper.issue_search import advanced_search_issues, search_issues
 from src.scraper.models import IssuerSearchResult
 
 logger = logging.getLogger(__name__)
@@ -135,23 +135,38 @@ def find_issues_for_borrower(
     """
     Primary entry point for Phase 1 borrower-centric discovery.
 
-    Searches EMMA for all bond issues linked to *borrower_name*, applies
-    name-variant expansion to catch abbreviated descriptions, scores each
-    result for borrower-name match quality, and optionally filters out
-    bonds that are likely fully matured or called.
+    Searches EMMA for all bond issues linked to *borrower_name*.
+
+    **Search strategy:**
+
+    1. **Advanced Search** (primary) — POSTs to EMMA's Advanced Search endpoint
+       with ``IncludeMaturedSecurities=False`` and ``IncludeFullyCalledSecurities=False``
+       when *exclude_matured* is True.  This uses EMMA's own authoritative maturity
+       data rather than an age heuristic.  Name-variant expansion is applied: each
+       generated variant (e.g. "RIDER UNIV") is searched separately and results are
+       deduplicated by issue_id.
+
+    2. **QuickSearch fallback** — If Advanced Search returns zero results (e.g. due
+       to a temporary endpoint change), QuickSearch is tried automatically.  In this
+       case the age-based ``_estimate_maturity()`` heuristic is applied instead.
+
+    Token-based match scoring is applied to all results regardless of search path
+    to eliminate false positives (e.g. Embry-RIDDLE bonds appearing in a Rider
+    University search).
 
     Args:
         session:        Active requests.Session (Disclaimer6 cookie must be set).
         borrower_name:  Full legal name of the borrower (e.g., "Rider University").
                         Case-insensitive.
-        state:          Optional two-letter state filter (applied client-side).
+        state:          Optional two-letter state filter.
         min_confidence: Results below this threshold are excluded as false
                         positives.  Range 0.0–1.0.  Default 0.6 means at least
                         60% of the borrower's key tokens must appear in the
                         bond description.  Use 1.0 for strictest matching.
-        exclude_matured: When True, issues flagged as `potentially_matured` by
-                        the age heuristic are removed from results.  Default True.
-                        Set False to include all issues regardless of age.
+        exclude_matured: When True, tells EMMA's Advanced Search to exclude fully
+                        matured and fully called/redeemed issues (the authoritative
+                        filter).  The age-heuristic is applied as a secondary check
+                        when falling back to QuickSearch.  Default True.
         use_cache:      Whether to use the response cache for EMMA requests.
 
     Returns:
@@ -166,27 +181,54 @@ def find_issues_for_borrower(
         search_terms,
     )
 
-    # --- Run searches for each variant and collect all raw results ---
+    # --- Primary: Advanced Search with EMMA's native maturity filter ---
     seen_ids: set[str] = set()
     raw_results: list[IssuerSearchResult] = []
+    used_advanced_search = False
 
     for term in search_terms:
-        results, _ = search_issues(
+        results, _ = advanced_search_issues(
             session,
-            search_text=term,
+            issue_description=term,
             state=state,
-            use_cache=use_cache,
+            include_matured=not exclude_matured,
+            include_fully_called=not exclude_matured,
         )
         for r in results:
             if r.issue_id not in seen_ids:
                 seen_ids.add(r.issue_id)
                 raw_results.append(r)
+        if results:
+            used_advanced_search = True
 
     logger.info(
-        "Raw results before scoring: %d unique issues from %d search variant(s)",
+        "Advanced Search: %d unique issues from %d variant(s)",
         len(raw_results),
         len(search_terms),
     )
+
+    # --- Fallback: QuickSearch if Advanced Search returned nothing ---
+    if not raw_results:
+        logger.warning(
+            "Advanced Search returned no results for '%s' — falling back to QuickSearch",
+            borrower_name,
+        )
+        for term in search_terms:
+            results, _ = search_issues(
+                session,
+                search_text=term,
+                state=state,
+                use_cache=use_cache,
+            )
+            for r in results:
+                if r.issue_id not in seen_ids:
+                    seen_ids.add(r.issue_id)
+                    raw_results.append(r)
+        logger.info(
+            "QuickSearch fallback: %d unique issues from %d variant(s)",
+            len(raw_results),
+            len(search_terms),
+        )
 
     # --- Score and annotate each result ---
     key_tokens = _extract_key_tokens(borrower_name)
@@ -194,7 +236,15 @@ def find_issues_for_borrower(
 
     for result in raw_results:
         confidence, reason = _score_borrower_match(result.issue_name, key_tokens)
-        matured = _estimate_maturity(result.issue_name, result.issue_date)
+
+        # Maturity flag:
+        # - When Advanced Search was used, EMMA already filtered matured/called bonds,
+        #   so we mark them as not matured (they passed EMMA's own filter).
+        # - When falling back to QuickSearch, apply the age heuristic instead.
+        if used_advanced_search:
+            matured = False   # EMMA's filter is authoritative
+        else:
+            matured = _estimate_maturity(result.issue_name, result.issue_date)
 
         result.match_confidence = confidence
         result.match_reason = reason
@@ -211,9 +261,9 @@ def find_issues_for_borrower(
             )
             continue
 
-        if exclude_matured and matured:
+        if not used_advanced_search and exclude_matured and matured:
             logger.debug(
-                "Excluding '%s' [%s] — flagged as potentially matured",
+                "Excluding '%s' [%s] — age heuristic flagged as potentially matured",
                 result.issue_name[:60],
                 result.issue_id,
             )
@@ -231,11 +281,12 @@ def find_issues_for_borrower(
 
     logger.info(
         "find_issues_for_borrower('%s') → %d issues after scoring "
-        "(min_confidence=%.2f, exclude_matured=%s)",
+        "(min_confidence=%.2f, exclude_matured=%s, used_advanced_search=%s)",
         borrower_name,
         len(scored),
         min_confidence,
         exclude_matured,
+        used_advanced_search,
     )
     return scored
 
