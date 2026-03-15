@@ -8,21 +8,45 @@ The system is built in six sequential phases. Each phase delivers standalone val
 
 ## Phase 1 — EMMA Scraping & Discovery Engine
 
-**Status:** In Progress
+**Status:** Complete ✅
 **Goal:** Build a reliable, respectful scraper that discovers and downloads EMMA disclosures without getting blocked.
 
 ### Deliverables
 
-- [ ] EMMA session manager (browser-like headers, persistent sessions, cookie handling)
-- [ ] Issue Search API client — discover bond issues by issuer, state, sector
-- [ ] Issue Details fetcher — pull bond series metadata, borrower name, issuer name
-- [ ] Continuing Disclosure page parser — list all documents for an issue
-- [ ] Document downloader — queue-based PDF fetcher with rate limiting
-- [ ] Material Event Notice fetcher
-- [ ] Trade data fetcher (optional, for price distress signals)
-- [ ] Incremental update logic — only fetch documents newer than last seen
-- [ ] Retry and error handling — exponential backoff, failure logging
-- [ ] Local document storage — organized by year/month/borrower
+- [x] EMMA session manager — `src/scraper/session.py` (browser-like headers, warm-up, cookie persistence)
+- [x] Issue Search API client — `src/scraper/issue_search.py` (paginated search, issuer and issue search)
+- [x] Issue Details fetcher — `src/scraper/issue_details.py` (borrower name, CUSIPs, continuing disclosure URL)
+- [x] Continuing Disclosure page parser — `src/scraper/continuing_disclosure.py` (JSON + HTML parsing)
+- [x] Document downloader — `src/scraper/document_fetcher.py` (queue-based, single and multi-threaded)
+- [x] Material Event Notice fetcher — `src/scraper/event_notices.py` (high-signal distress tagging)
+- [x] Incremental update logic — built into `continuing_disclosure.py` via `last_seen_date` cursor
+- [x] Retry and error handling — `src/scraper/retry.py` (exponential backoff: 5s → 30s → 120s)
+- [x] Rate limiter — `src/scraper/rate_limiter.py` (1 req/s discovery, 2.5s downloads)
+- [x] Response cache — `src/scraper/cache.py` (file-based, TTL per page type)
+- [x] Local document storage — `src/scraper/storage.py` (organized by year/month/borrower-slug)
+- [x] Download queue — `src/scraper/document_queue.py` (JSON-backed, crash-safe, idempotent)
+- [x] Structured logger — `src/scraper/logger.py` (JSON output, rotating file handler)
+- [x] CLI interface — `src/scraper/cli.py` (search, discover, download, events, queue, stats)
+- [x] Data models — `src/scraper/models.py` (typed dataclasses for all entities)
+
+### Source Files
+
+| File | Purpose |
+|------|---------|
+| `src/scraper/models.py` | Typed dataclass models for all EMMA entities |
+| `src/scraper/session.py` | EMMA session manager with browser-like headers |
+| `src/scraper/rate_limiter.py` | Thread-safe per-layer rate limiting |
+| `src/scraper/retry.py` | Exponential backoff retry with 429/5xx handling |
+| `src/scraper/cache.py` | File-based response caching with TTLs |
+| `src/scraper/storage.py` | Raw PDF storage (data/raw_documents/YYYY/MM/borrower/) |
+| `src/scraper/logger.py` | JSON structured logger with rotating file handler |
+| `src/scraper/issue_search.py` | /api/Search/Issue and /api/Search/Issuer clients |
+| `src/scraper/issue_details.py` | /IssueView/Details/{id} HTML parser |
+| `src/scraper/continuing_disclosure.py` | /IssueView/ContinuingDisclosure/{id} parser |
+| `src/scraper/document_queue.py` | JSON-backed download queue (Phase 2 migrates to DB) |
+| `src/scraper/document_fetcher.py` | Queue-based PDF downloader (1–3 workers) |
+| `src/scraper/event_notices.py` | /api/Search/EventNotice client with distress tagging |
+| `src/scraper/cli.py` | argparse CLI: search, discover, download, events, stats |
 
 ### Key Design Decisions
 

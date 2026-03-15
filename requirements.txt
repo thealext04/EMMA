@@ -1,0 +1,40 @@
+# EMMA Municipal Distress Monitoring System — Python Dependencies
+# Install: pip install -r requirements.txt
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Scraping & Discovery
+# ---------------------------------------------------------------------------
+
+# HTTP client — session management, connection pooling
+requests>=2.31.0
+
+# HTML parsing — for IssueView/Details and disclosure pages
+beautifulsoup4>=4.12.0
+lxml>=4.9.0          # Faster HTML parser backend for BeautifulSoup
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Database (install when starting Phase 2)
+# ---------------------------------------------------------------------------
+
+# SQLAlchemy>=2.0.0
+# psycopg2-binary>=2.9.0   # PostgreSQL driver
+# alembic>=1.13.0          # Database migrations
+
+# ---------------------------------------------------------------------------
+# Phase 4 — AI Parsing (install when starting Phase 4)
+# ---------------------------------------------------------------------------
+
+# anthropic>=0.25.0        # Claude API client
+# pdfplumber>=0.10.0       # PDF text extraction
+# pytesseract>=0.3.10      # OCR fallback for scanned PDFs
+# Pillow>=10.0.0           # Image handling for OCR
+
+# ---------------------------------------------------------------------------
+# Development & Testing
+# ---------------------------------------------------------------------------
+
+# pytest>=7.4.0
+# pytest-cov>=4.1.0
+# responses>=0.24.0        # Mock HTTP responses in tests
+# black>=23.0.0            # Code formatter
+# ruff>=0.1.0              # Linter

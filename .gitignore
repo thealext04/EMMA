@@ -30,12 +30,19 @@ config_local.py
 *.sqlite
 *.sqlite3
 
-# Downloaded documents (large binary files)
-data/raw_documents/
+# Downloaded documents (large binary files — keep directory structure)
+data/raw_documents/**/*.pdf
 
-# Cache
-data/.cache/
+# Cache files
+data/.cache/*.json
 *.cache
+
+# Queue state (runtime artifact)
+data/queue/queue.json
+data/queue/queue.json.corrupt
+
+# Logs
+data/logs/*.log
 
 # IDE
 .vscode/
