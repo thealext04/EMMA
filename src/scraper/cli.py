@@ -544,6 +544,60 @@ def cmd_borrower_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_borrower_update(args: argparse.Namespace) -> int:
+    """Update editable fields on an existing borrower record."""
+    from src.db.engine import Session
+    from src.db.repositories.borrower import BorrowerRepository, VALID_SECTORS, VALID_DISTRESS_STATUSES
+
+    with Session() as session:
+        repo = BorrowerRepository(session)
+        borrower = repo.get(args.borrower_id)
+
+        if not borrower:
+            print(f"Borrower #{args.borrower_id} not found.")
+            return 1
+
+        changed: list[str] = []
+
+        if args.name is not None:
+            borrower.borrower_name = args.name.strip()
+            changed.append("name")
+        if args.sector is not None:
+            if args.sector not in VALID_SECTORS:
+                print(f"ERROR: Invalid sector '{args.sector}'. Valid: {sorted(VALID_SECTORS)}")
+                return 1
+            borrower.sector = args.sector
+            changed.append("sector")
+        if args.state is not None:
+            borrower.state = args.state.upper()
+            changed.append("state")
+        if args.city is not None:
+            borrower.city = args.city
+            changed.append("city")
+        if args.fye is not None:
+            borrower.fiscal_year_end = args.fye
+            changed.append("fiscal_year_end")
+        if args.notes is not None:
+            borrower.watchlist_notes = args.notes
+            changed.append("watchlist_notes")
+        if args.status is not None:
+            if args.status not in VALID_DISTRESS_STATUSES:
+                print(f"ERROR: Invalid status '{args.status}'. Valid: {sorted(VALID_DISTRESS_STATUSES)}")
+                return 1
+            borrower.distress_status = args.status
+            changed.append("distress_status")
+
+        if not changed:
+            print("Nothing to update — no fields specified.")
+            return 0
+
+        session.commit()
+        print(f"\nUpdated borrower #{borrower.borrower_id} ({', '.join(changed)}):")
+        _print_borrower(borrower)
+
+    return 0
+
+
 def _print_borrower(b) -> None:
     """Pretty-print a single Borrower record."""
     print(f"  ID             : {b.borrower_id}")
@@ -718,6 +772,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p_bshow = borrower_sub.add_parser("show", help="Show detail for one borrower")
     p_bshow.add_argument("borrower_id", type=int, help="Borrower ID")
     p_bshow.set_defaults(func=cmd_borrower_show)
+
+    # borrower update
+    p_bupdate = borrower_sub.add_parser("update", help="Update fields on a borrower record")
+    p_bupdate.add_argument("borrower_id", type=int, help="Borrower ID")
+    p_bupdate.add_argument("--name",   default=None, help="New borrower name")
+    p_bupdate.add_argument("--sector", default=None, help="New sector")
+    p_bupdate.add_argument("--state",  default=None, help="Two-letter state code")
+    p_bupdate.add_argument("--city",   default=None, help="City")
+    p_bupdate.add_argument("--fye",    default=None, metavar="MM-DD", help="Fiscal year end")
+    p_bupdate.add_argument("--notes",  default=None, help="Watchlist notes (replaces existing)")
+    p_bupdate.add_argument("--status", default=None,
+                           choices=["monitor", "watch", "distressed", "resolved"],
+                           help="Distress status")
+    p_bupdate.set_defaults(func=cmd_borrower_update)
 
     # borrower sync
     p_bsync = borrower_sub.add_parser(

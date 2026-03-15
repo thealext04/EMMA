@@ -218,10 +218,10 @@ BORROWERS = [
     },
     {
         "borrower_name":  "Anderson University",
-        "state":          "SC",
+        "state":          "IN",
         "city":           "Anderson",
         "fiscal_year_end": "06-30",
-        "watchlist_notes": "Baptist; entered as SC campus — update state to IN if tracking Indiana institution",
+        "watchlist_notes": "Church of God (Anderson, IN); Free Methodist-affiliated liberal arts",
     },
     {
         "borrower_name":  "Hartwick College",
