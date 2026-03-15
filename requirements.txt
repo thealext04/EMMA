@@ -13,12 +13,12 @@ beautifulsoup4>=4.12.0
 lxml>=4.9.0          # Faster HTML parser backend for BeautifulSoup
 
 # ---------------------------------------------------------------------------
-# Phase 2 — Database (install when starting Phase 2)
+# Phase 2 — Database
 # ---------------------------------------------------------------------------
 
-# SQLAlchemy>=2.0.0
-# psycopg2-binary>=2.9.0   # PostgreSQL driver
-# alembic>=1.13.0          # Database migrations
+SQLAlchemy>=2.0.0
+psycopg2-binary>=2.9.0    # PostgreSQL driver (not needed if using SQLite)
+# alembic>=1.13.0          # Database migrations — add when schema stabilises
 
 # ---------------------------------------------------------------------------
 # Phase 4 — AI Parsing (install when starting Phase 4)

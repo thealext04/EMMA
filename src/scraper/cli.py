@@ -296,6 +296,144 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Database commands
+# ---------------------------------------------------------------------------
+
+def cmd_initdb(args: argparse.Namespace) -> int:
+    """Create all database tables. Safe to run multiple times."""
+    from src.db.init_db import init_db
+    from src.db.engine import DATABASE_URL
+
+    print(f"\nInitializing database: {DATABASE_URL.split('@')[-1]}")
+    try:
+        init_db()
+        print("Database ready.")
+    except Exception as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    return 0
+
+
+def cmd_borrower_add(args: argparse.Namespace) -> int:
+    """Add a borrower to the watchlist database."""
+    from src.db.engine import Session
+    from src.db.repositories.borrower import BorrowerRepository
+
+    with Session() as session:
+        repo = BorrowerRepository(session)
+        try:
+            borrower, created = repo.get_or_create(
+                borrower_name=args.name,
+                sector=args.sector,
+                state=args.state,
+                city=args.city,
+                fiscal_year_end=args.fye,
+                watchlist_notes=args.notes,
+            )
+            session.commit()
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            return 1
+
+        if created:
+            print(f"\nAdded borrower #{borrower.borrower_id}:")
+        else:
+            print(f"\nBorrower already exists (#{borrower.borrower_id}):")
+
+        _print_borrower(borrower)
+    return 0
+
+
+def cmd_borrower_list(args: argparse.Namespace) -> int:
+    """List tracked borrowers."""
+    from src.db.engine import Session
+    from src.db.repositories.borrower import BorrowerRepository
+
+    with Session() as session:
+        repo = BorrowerRepository(session)
+
+        if args.show_all:
+            borrowers = repo.list_all()
+            header = "All borrowers"
+        else:
+            borrowers = repo.list_watchlist(sector=args.sector, state=args.state)
+            header = "Watchlist"
+
+        if not borrowers:
+            print("No borrowers found.")
+            return 0
+
+        filters = []
+        if args.sector:
+            filters.append(f"sector={args.sector}")
+        if args.state:
+            filters.append(f"state={args.state}")
+        filter_str = f"  [{', '.join(filters)}]" if filters else ""
+
+        print(f"\n{header}{filter_str} — {len(borrowers)} borrower(s)\n")
+        print(f"  {'ID':>4}  {'Name':<40}  {'Sector':<20}  {'State':>5}  {'FYE':>5}  Status")
+        print("  " + "-" * 95)
+
+        for b in borrowers:
+            score_str = f"[{b.distress_score:>3}]" if b.distress_score is not None else "     "
+            print(
+                f"  {b.borrower_id:>4}  {b.borrower_name:<40.40}  {(b.sector or ''):.<20}  "
+                f"{(b.state or ''):>5}  {(b.fiscal_year_end or ''):>5}  "
+                f"{score_str} {b.distress_status or ''}"
+            )
+
+    return 0
+
+
+def cmd_borrower_show(args: argparse.Namespace) -> int:
+    """Show detail for one borrower."""
+    from src.db.engine import Session
+    from src.db.repositories.borrower import BorrowerRepository
+    from src.db.repositories.bond_issue import BondIssueRepository
+
+    with Session() as session:
+        repo = BorrowerRepository(session)
+        borrower = repo.get(args.borrower_id)
+
+        if not borrower:
+            print(f"Borrower #{args.borrower_id} not found.")
+            return 1
+
+        _print_borrower(borrower)
+
+        issue_repo = BondIssueRepository(session)
+        issues = issue_repo.list_for_borrower(args.borrower_id)
+
+        if issues:
+            print(f"\n  Bond Issues ({len(issues)}):")
+            for i in issues:
+                print(
+                    f"    [{i.emma_issue_id}]  {i.series_name or 'N/A'}"
+                    f"  |  {i.state or ''}  |  dated {i.issue_date or 'N/A'}"
+                )
+        else:
+            print("\n  No bond issues linked yet.")
+
+    return 0
+
+
+def _print_borrower(b) -> None:
+    """Pretty-print a single Borrower record."""
+    print(f"  ID             : {b.borrower_id}")
+    print(f"  Name           : {b.borrower_name}")
+    print(f"  Sector         : {b.sector or 'N/A'}")
+    print(f"  State          : {b.state or 'N/A'}")
+    print(f"  City           : {b.city or 'N/A'}")
+    print(f"  Fiscal Year End: {b.fiscal_year_end or 'N/A'}")
+    print(f"  Distress Status: {b.distress_status or 'N/A'}")
+    print(f"  Distress Score : {b.distress_score if b.distress_score is not None else 'N/A'}")
+    print(f"  On Watchlist   : {b.on_watchlist}")
+    print(f"  Watchlist Since: {b.watchlist_since or 'N/A'}")
+    if b.watchlist_notes:
+        print(f"  Notes          : {b.watchlist_notes}")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -415,6 +553,44 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- stats ---
     p_stats = subparsers.add_parser("stats", help="Show storage and queue statistics")
     p_stats.set_defaults(func=cmd_stats)
+
+    # --- db init ---
+    p_initdb = subparsers.add_parser("initdb", help="Create database tables (run once)")
+    p_initdb.set_defaults(func=cmd_initdb)
+
+    # --- borrower ---
+    p_borrower = subparsers.add_parser("borrower", help="Manage tracked borrowers")
+    borrower_sub = p_borrower.add_subparsers(title="actions", metavar="ACTION")
+
+    # borrower add
+    p_badd = borrower_sub.add_parser("add", help="Add a borrower to the watchlist")
+    p_badd.add_argument("name", help="Full legal borrower name")
+    p_badd.add_argument(
+        "--sector",
+        required=True,
+        choices=["higher_ed", "healthcare", "general_government", "housing",
+                 "utility", "transportation", "other"],
+        help="Borrower sector",
+    )
+    p_badd.add_argument("--state", default=None, help="Two-letter state code")
+    p_badd.add_argument("--city",  default=None, help="City")
+    p_badd.add_argument("--fye",   default=None,
+                        metavar="MM-DD", help="Fiscal year end date (e.g. 06-30)")
+    p_badd.add_argument("--notes", default=None, help="Watchlist notes")
+    p_badd.set_defaults(func=cmd_borrower_add)
+
+    # borrower list
+    p_blist = borrower_sub.add_parser("list", help="List tracked borrowers")
+    p_blist.add_argument("--sector", default=None, help="Filter by sector")
+    p_blist.add_argument("--state",  default=None, help="Filter by state")
+    p_blist.add_argument("--all",    action="store_true", dest="show_all",
+                         help="Include borrowers not on watchlist")
+    p_blist.set_defaults(func=cmd_borrower_list)
+
+    # borrower show
+    p_bshow = borrower_sub.add_parser("show", help="Show detail for one borrower")
+    p_bshow.add_argument("borrower_id", type=int, help="Borrower ID")
+    p_bshow.set_defaults(func=cmd_borrower_show)
 
     return parser
 
