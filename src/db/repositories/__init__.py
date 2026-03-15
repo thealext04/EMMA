@@ -11,3 +11,4 @@ Available repositories:
 
 from src.db.repositories.borrower import BorrowerRepository    # noqa: F401
 from src.db.repositories.bond_issue import BondIssueRepository  # noqa: F401
+from src.db.repositories.document import DocumentRepository     # noqa: F401

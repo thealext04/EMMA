@@ -209,6 +209,7 @@ class Document(Base):
     borrower_id       = Column(Integer, ForeignKey("borrowers.borrower_id"))
     emma_doc_id       = Column(Text, unique=True)
     doc_type          = Column(Text, nullable=False)
+    title             = Column(Text)                        # document title from EMMA
     doc_date          = Column(Date)                        # date of the document
     posted_date       = Column(Date)                        # date posted to EMMA
     fiscal_year       = Column(Integer)                     # fiscal year covered
