@@ -61,20 +61,28 @@ def main(argv: Optional[list[str]] = None) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_search(args: argparse.Namespace) -> int:
-    """Search for bond issues by issuer/borrower name."""
+    """Search for bond issues by borrower name with match scoring and maturity filtering."""
     from src.scraper.session import EMMAsession
-    from src.scraper.issue_search import search_all_pages
+    from src.scraper.borrower_search import find_issues_for_borrower
 
-    print(f"\nSearching EMMA for: '{args.query}'" + (f" (state={args.state})" if args.state else ""))
+    state_note = f" (state={args.state})" if args.state else ""
+    matured_note = " [including matured]" if args.include_matured else ""
+    print(
+        f"\nSearching EMMA for borrower: '{args.query}'"
+        f"{state_note}{matured_note}"
+    )
+    print(f"Min confidence: {args.min_confidence:.0%}  |  Exclude matured: {not args.include_matured}")
     print("-" * 60)
 
     mgr = EMMAsession()
     session = mgr.get_session()
 
-    results = search_all_pages(
+    results = find_issues_for_borrower(
         session,
-        search_text=args.query,
+        borrower_name=args.query,
         state=args.state,
+        min_confidence=args.min_confidence,
+        exclude_matured=not args.include_matured,
         use_cache=not args.no_cache,
     )
 
@@ -83,12 +91,15 @@ def cmd_search(args: argparse.Namespace) -> int:
         return 0
 
     for r in results:
-        par = f"${r.par_amount:,.0f}" if r.par_amount else "N/A"
+        confidence_bar = "█" * int(r.match_confidence * 10) + "░" * (10 - int(r.match_confidence * 10))
+        matured_flag = "  ⚠ MATURED?" if r.potentially_matured else ""
         print(
-            f"  [{r.issue_id}] {r.issuer_name}\n"
-            f"     Series : {r.issue_name}\n"
-            f"     State  : {r.state or 'N/A'}  |  Type: {r.bond_type or 'N/A'}  |  Par: {par}\n"
-            f"     URL    : {r.emma_url}\n"
+            f"  [{r.issue_id}]\n"
+            f"     Issuer     : {r.issuer_name}\n"
+            f"     Series     : {r.issue_name}\n"
+            f"     State      : {r.state or 'N/A'}  |  Dated: {r.issue_date or 'N/A'}\n"
+            f"     Confidence : {confidence_bar} {r.match_confidence:.0%}{matured_flag}\n"
+            f"     URL        : {r.emma_url}\n"
         )
 
     print(f"Total: {len(results)} issue(s) found")
@@ -331,9 +342,31 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(title="commands", metavar="COMMAND")
 
     # --- search ---
-    p_search = subparsers.add_parser("search", help="Search for bond issues by name")
-    p_search.add_argument("query", help="Issuer or borrower name to search")
+    p_search = subparsers.add_parser(
+        "search",
+        help="Search for bond issues by borrower name (with match scoring and maturity filter)",
+    )
+    p_search.add_argument("query", help="Borrower name to search (e.g. 'Rider University')")
     p_search.add_argument("--state", default=None, help="Filter by two-letter state code")
+    p_search.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.6,
+        metavar="FLOAT",
+        help=(
+            "Minimum match confidence 0.0–1.0 (default: 0.6). "
+            "Lower = more permissive, higher = stricter. "
+            "Use 1.0 to require all borrower name tokens to match exactly."
+        ),
+    )
+    p_search.add_argument(
+        "--include-matured",
+        action="store_true",
+        help=(
+            "Include bonds that the age heuristic flags as potentially "
+            "matured or fully called (excluded by default)."
+        ),
+    )
     p_search.add_argument("--no-cache", action="store_true", help="Bypass response cache")
     p_search.set_defaults(func=cmd_search)
 

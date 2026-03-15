@@ -17,17 +17,31 @@ from typing import Optional
 @dataclass
 class IssuerSearchResult:
     """
-    One result row from /api/Search/Issue or /api/Search/Issuer.
+    One result row returned by the EMMA QuickSearch endpoint.
+
     Lightweight — only metadata returned by the search endpoint.
+
+    Scoring fields (populated by borrower_search, not issue_search):
+        match_confidence  — 0.0–1.0. Fraction of borrower name key-tokens
+                            that appear as whole words in issue_name.
+                            1.0 = all tokens matched. 0.0 = no tokens matched.
+        match_reason      — Human-readable explanation of the confidence score.
+        potentially_matured — True when the age heuristic suggests this issue
+                              may be fully matured or called. See
+                              borrower_search._estimate_maturity() for details.
     """
     issue_id: str                          # EMMA internal issue ID
     issuer_name: str
-    issue_name: str                        # Bond series name
+    issue_name: str                        # Bond series name / description
     state: Optional[str]
     bond_type: Optional[str]
     par_amount: Optional[float]            # Original par amount in dollars
     issue_date: Optional[date]
     emma_url: str                          # Full EMMA URL for this issue
+    # --- Populated by borrower_search (defaults keep raw search results valid) ---
+    match_confidence: float = 1.0
+    match_reason: str = ""
+    potentially_matured: bool = False
 
 
 @dataclass
