@@ -422,16 +422,21 @@ def cmd_borrower_sync(args: argparse.Namespace) -> int:
     Discover bond issues and disclosure documents for a borrower and store
     them in the database.
 
-    This is the core Phase 2 integration: Phase 1 scraping → Phase 2 DB.
-    Documents are stored as URL + metadata only — no PDFs are downloaded.
+    Uses former_names (if set) to search EMMA under historical institution names
+    in addition to the current borrower_name.
+
+    With --clean: wipes existing bond issues and documents for this borrower
+    before syncing, giving a fresh slate with the latest filtering logic.
     """
     from src.db.engine import Session
+    from src.db.models import BondIssue, Document
     from src.db.repositories.borrower import BorrowerRepository
     from src.db.repositories.bond_issue import BondIssueRepository
     from src.db.repositories.document import DocumentRepository, classify_doc_type
     from src.scraper.session import EMMAsession
     from src.scraper.borrower_search import find_issues_for_borrower
     from src.scraper.continuing_disclosure import fetch_disclosure_documents
+    from sqlalchemy import select
 
     with Session() as session:
         borrower_repo = BorrowerRepository(session)
@@ -443,18 +448,50 @@ def cmd_borrower_sync(args: argparse.Namespace) -> int:
         print(f"\nSyncing: {borrower.borrower_name} (#{borrower.borrower_id})")
         print("-" * 60)
 
+        # --- Optional clean: wipe existing data before re-sync ---
+        if getattr(args, "clean", False):
+            existing_issues = session.execute(
+                select(BondIssue).where(BondIssue.borrower_id == borrower.borrower_id)
+            ).scalars().all()
+            doc_count = 0
+            for issue in existing_issues:
+                docs_deleted = session.execute(
+                    select(Document).where(Document.issue_id == issue.issue_id)
+                ).scalars().all()
+                for d in docs_deleted:
+                    session.delete(d)
+                    doc_count += 1
+                session.delete(issue)
+            session.flush()
+            print(f"  Cleaned: removed {len(existing_issues)} issues and {doc_count} documents.\n")
+
         emma = EMMAsession()
         emma_session = emma.get_session()
 
-        # --- Step 1: Discover bond issues via EMMA Advanced Search ---
-        print(f"Searching EMMA for bond issues...")
-        issues_found = find_issues_for_borrower(
-            emma_session,
-            borrower_name=borrower.borrower_name,
-            state=borrower.state,
-            min_confidence=args.min_confidence,
-            exclude_matured=not args.include_matured,
-        )
+        # --- Step 1: Build list of search names (current + former) ---
+        search_names = [borrower.borrower_name]
+        if borrower.former_names:
+            former = [n.strip() for n in borrower.former_names.split("|") if n.strip()]
+            search_names.extend(former)
+
+        if len(search_names) > 1:
+            print(f"  Searching under {len(search_names)} name(s): {search_names}")
+
+        # --- Step 2: Discover bond issues across all search names ---
+        seen_issue_ids: set[str] = set()
+        issues_found = []
+        for name in search_names:
+            found = find_issues_for_borrower(
+                emma_session,
+                borrower_name=name,
+                state=borrower.state,
+                min_confidence=args.min_confidence,
+                exclude_matured=not args.include_matured,
+            )
+            for issue in found:
+                if issue.issue_id not in seen_issue_ids:
+                    seen_issue_ids.add(issue.issue_id)
+                    issues_found.append(issue)
 
         if not issues_found:
             print("  No active bond issues found on EMMA.")
@@ -470,7 +507,7 @@ def cmd_borrower_sync(args: argparse.Namespace) -> int:
         total_docs_skipped = 0
 
         for emma_issue in issues_found:
-            # --- Step 2: Upsert bond issue into database ---
+            # --- Step 3: Upsert bond issue into database ---
             db_issue, issue_created = issue_repo.upsert_from_emma(
                 borrower_id=borrower.borrower_id,
                 emma_issue_id=emma_issue.issue_id,
@@ -485,11 +522,10 @@ def cmd_borrower_sync(args: argparse.Namespace) -> int:
                 f"  [{status}] {emma_issue.issue_id}  "
                 f"{emma_issue.issue_name[:55]}"
             )
-
             if issue_created:
                 total_issues_added += 1
 
-            # --- Step 3: Fetch disclosure documents for this issue ---
+            # --- Step 4: Fetch disclosure documents for this issue ---
             try:
                 disclosure_docs = fetch_disclosure_documents(
                     emma_session,
@@ -502,10 +538,10 @@ def cmd_borrower_sync(args: argparse.Namespace) -> int:
                 )
                 disclosure_docs = []
 
-            # --- Step 4: Store document URLs in database ---
+            # --- Step 5: Store document URLs in database ---
             issue_added = 0
             for doc in disclosure_docs:
-                doc_type = classify_doc_type(doc.title, doc.doc_type)
+                doc_type = classify_doc_type(doc.title or "", doc.doc_type or "")
 
                 # Build a stable unique ID from the URL if EMMA didn't provide one
                 emma_doc_id = doc.doc_id or doc.doc_url.split("/")[-1].split("?")[0]
@@ -809,6 +845,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-cache",
         action="store_true",
         help="Bypass response cache for fresh EMMA data",
+    )
+    p_bsync.add_argument(
+        "--clean",
+        action="store_true",
+        help=(
+            "Wipe all existing bond issues and documents for this borrower "
+            "before syncing. Use after fixing false positives or scoring changes."
+        ),
     )
     p_bsync.set_defaults(func=cmd_borrower_sync)
 

@@ -64,6 +64,7 @@ class BorrowerRepository:
         city: Optional[str] = None,
         fiscal_year_end: Optional[str] = None,
         watchlist_notes: Optional[str] = None,
+        former_names: Optional[list[str]] = None,
         distress_status: str = "monitor",
         on_watchlist: bool = True,
     ) -> Borrower:
@@ -108,6 +109,7 @@ class BorrowerRepository:
             on_watchlist=on_watchlist,
             watchlist_since=date.today() if on_watchlist else None,
             watchlist_notes=watchlist_notes,
+            former_names="|".join(former_names) if former_names else None,
         )
         self.session.add(borrower)
         logger.info("Queued new borrower: %r [%s]", borrower_name, sector)

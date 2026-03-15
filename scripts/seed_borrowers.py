@@ -201,6 +201,7 @@ BORROWERS = [
         "city":           "Minneapolis",
         "fiscal_year_end": "06-30",
         "watchlist_notes": "Lutheran; urban campus, modest endowment, adult learner focus",
+        "former_names":   ["Augsburg College"],   # renamed 2017; older EMMA bonds use former name
     },
     {
         "borrower_name":  "Vaughn College of Aeronautics and Technology",
@@ -215,6 +216,7 @@ BORROWERS = [
         "city":           "Utica",
         "fiscal_year_end": "06-30",
         "watchlist_notes": "Independent; upstate New York demographic headwinds",
+        "former_names":   ["Utica College"],   # renamed 2022; older EMMA bonds use former name
     },
     {
         "borrower_name":  "Anderson University",
@@ -281,6 +283,7 @@ def seed() -> None:
                     city=b["city"],
                     fiscal_year_end=b["fiscal_year_end"],
                     watchlist_notes=b.get("watchlist_notes"),
+                    former_names=b.get("former_names"),
                 )
                 session.flush()
                 result = "ADDED" if created else "exists"

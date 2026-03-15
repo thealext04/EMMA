@@ -107,6 +107,16 @@ _BOND_STOPWORDS: frozenset[str] = frozenset({
     "FINANCING", "FINANCE", "DEVELOPMENT", "IMPROVEMENT",
     # Common legal connectors
     "AND", "THE", "OF", "FOR", "IN", "A", "AN", "AT", "BY", "TO",
+    # Institution-type words — appear in virtually every higher-ed bond description
+    # and carry no borrower-identity information.  Without these, tokens like
+    # "UNIVERSITY" or "COLLEGE" inflate confidence scores and cause false positives:
+    # e.g. "FRESNO PACIFIC UNIV" scoring 0.67 against "Azusa Pacific University"
+    # because PACIFIC and UNIVERSITY both match.
+    "UNIVERSITY", "UNIVERSITIES", "UNIV",
+    "COLLEGE", "COLLEGES", "COLL",
+    "SCHOOL", "SCHOOLS",
+    "INSTITUTE", "INSTITUTION", "INST",
+    "ACADEMY",
     # Short abbreviations that are too ambiguous alone
     "U", "A", "B", "C", "D",
 })

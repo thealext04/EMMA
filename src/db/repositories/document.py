@@ -46,29 +46,48 @@ VALID_DOC_TYPES = {
 
 # Keywords used to classify doc_type from EMMA's free-text document labels.
 # Checked in order — first match wins.
+#
+# EMMA's actual continuing-disclosure label conventions (discovered from live data):
+#   "Financial Operating Filing (...)"  → financial_statement
+#   "Event Filing as of MM/DD/YYYY ..."  → event_notice
+#   "Official Statement (...)"           → bond_issuance
+#
+# IMPORTANT: do NOT use bare "rating" as a keyword — it is a substring of
+# "operating" and would misclassify every "Financial Operating Filing" as a
+# rating_notice.  Use full phrases like "rating action" or "credit rating" instead.
 _TYPE_KEYWORDS: list[tuple[str, list[str]]] = [
     ("financial_statement", [
+        # EMMA's native continuing-disclosure label — highest priority
+        "financial operating filing",
+        # Other common patterns
         "annual financial", "audited financial", "financial statement",
-        "audit report", "auditor", "cafr", "annual report",
+        "audit report", "auditor's report", "cafr",
+        "annual report", "comprehensive annual",
     ]),
     ("event_notice", [
-        "material event", "event notice", "covenant", "default",
-        "rating change", "rating action", "forbearance", "bankruptcy",
-        "going concern", "liquidity",
+        # EMMA's native event-notice label
+        "event filing",
+        # Other common patterns
+        "material event", "event notice", "covenant",
+        "going concern", "forbearance", "bankruptcy",
+        "liquidity facility", "payment default",
     ]),
     ("operating_report", [
         "operating report", "management report", "quarterly report",
-        "monthly report", "interim report",
+        "monthly report", "interim report", "continuing disclosure report",
     ]),
     ("budget", [
-        "budget", "adopted budget", "proposed budget",
+        "annual budget", "adopted budget", "proposed budget",
     ]),
     ("rating_notice", [
-        "rating", "moody", "standard & poor", "s&p", "fitch",
+        # Precise multi-word phrases only — avoids the "oper-ating" collision
+        "rating action", "rating change", "rating report", "rating letter",
+        "credit rating", "rating agency", "rating upgrade", "rating downgrade",
+        "moody", "standard & poor", "fitch",
     ]),
     ("bond_issuance", [
         "official statement", "preliminary official", "offering memorandum",
-        "bond prospectus",
+        "bond prospectus", "remarketing supplement",
     ]),
 ]
 
@@ -78,12 +97,43 @@ def classify_doc_type(title: str, emma_type_label: str = "") -> str:
     Infer a canonical doc_type from EMMA's title and type label strings.
 
     Checks _TYPE_KEYWORDS in priority order; falls back to "other".
+
+    Key design decisions:
+    - "Financial Operating Filing" (EMMA's label for annual financial disclosures)
+      is matched first and explicitly, before any shorter-phrase rules.
+    - "Event Filing" (EMMA's label for material event notices) is matched first.
+    - "rating" is NOT used as a bare substring keyword because it is a substring
+      of "operating" — causing every financial filing to be misclassified.
     """
     combined = (title + " " + emma_type_label).lower()
     for doc_type, keywords in _TYPE_KEYWORDS:
         if any(kw in combined for kw in keywords):
             return doc_type
     return "other"
+
+
+def reclassify_all_documents(session) -> tuple[int, dict[str, int]]:
+    """
+    Re-apply classify_doc_type() to every document in the database.
+
+    Used after fixing the classifier to correct previously misclassified records.
+    Caller must commit the session after this returns.
+
+    Returns:
+        (updated_count, final_type_distribution)
+    """
+    docs = session.execute(select(Document)).scalars().all()
+    updated = 0
+    distribution: dict[str, int] = {}
+
+    for doc in docs:
+        new_type = classify_doc_type(doc.title or "")
+        if new_type != doc.doc_type:
+            doc.doc_type = new_type
+            updated += 1
+        distribution[new_type] = distribution.get(new_type, 0) + 1
+
+    return updated, distribution
 
 
 class DocumentRepository:

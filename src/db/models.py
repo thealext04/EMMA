@@ -65,6 +65,9 @@ class Borrower(Base):
     distress_status = Column(Text, default="monitor")
     distress_score  = Column(Integer)                       # 0–100
     fiscal_year_end = Column(Text)                          # MM-DD, e.g. "06-30"
+    former_names    = Column(Text)                          # pipe-separated former legal names
+                                                            # e.g. "Augsburg College|Augsburg Univ"
+                                                            # searched in addition to borrower_name
     on_watchlist    = Column(Boolean, default=True)         # all inserted borrowers are tracked
     watchlist_since = Column(Date)
     watchlist_notes = Column(Text)
