@@ -25,10 +25,12 @@ ENV/
 secrets.py
 config_local.py
 
-# Database files
+# Database files (data/emma.db is gitignored; schema lives in src/db/models.py)
 *.db
 *.sqlite
 *.sqlite3
+*.db-shm
+*.db-wal
 
 # Downloaded documents (large binary files — keep directory structure)
 data/raw_documents/**/*.pdf

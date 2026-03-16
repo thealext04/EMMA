@@ -1,23 +1,36 @@
 """
-cli.py — Command-line interface for the EMMA Phase 1 scraper.
+cli.py — Command-line interface for the EMMA Municipal Distress Monitoring System.
 
-Commands:
+Phase 1–2 Commands:
     search      Search for bond issues by borrower/issuer name
     discover    Discover new disclosure documents for a bond issue
     download    Process the download queue (fetch queued PDFs)
     events      Fetch recent material event notices
     queue       Show download queue status
     stats       Show storage and queue statistics
+    initdb      Create database tables
+    config      Show configuration (storage path, API key status, drive check)
+    borrower    Manage tracked borrowers (add, list, show, update, sync)
+
+Phase 3 Commands:
+    report      Read-only reports on filing status
+      last-financials  When did each borrower last publish financials?
+      late-filings     Which borrowers are past their disclosure deadline?
+    monitor     Surveillance actions
+      scan             Run the late-filing detector; optionally write events to DB
 
 Usage:
     python -m src.scraper.cli search "Manhattan College"
     python -m src.scraper.cli search "Rider University" --state NJ
     python -m src.scraper.cli discover --issue-id ABC123DE
-    python -m src.scraper.cli discover --cusip 04781GAB7
     python -m src.scraper.cli download --workers 2 --limit 100
     python -m src.scraper.cli events --days 7 --high-signal-only
-    python -m src.scraper.cli queue
-    python -m src.scraper.cli stats
+    python -m src.scraper.cli borrower list
+    python -m src.scraper.cli borrower sync 5 --clean
+    python -m src.scraper.cli report last-financials
+    python -m src.scraper.cli report late-filings
+    python -m src.scraper.cli monitor scan --dry-run
+    python -m src.scraper.cli monitor scan --write-events
 """
 
 import argparse
@@ -478,13 +491,19 @@ def cmd_borrower_sync(args: argparse.Namespace) -> int:
             print(f"  Searching under {len(search_names)} name(s): {search_names}")
 
         # --- Step 2: Discover bond issues across all search names ---
+        # NOTE: We do NOT pass state= to find_issues_for_borrower.
+        # The issuing authority (conduit) can be domiciled in any state —
+        # it does not have to match the borrower's home state.
+        # Example: Lake Erie College (OH) may have bonds issued through
+        # a Wisconsin authority.  Name-based confidence scoring is the
+        # correct filter; state is irrelevant to the issuing-authority search.
         seen_issue_ids: set[str] = set()
         issues_found = []
         for name in search_names:
             found = find_issues_for_borrower(
                 emma_session,
                 borrower_name=name,
-                state=borrower.state,
+                state=None,
                 min_confidence=args.min_confidence,
                 exclude_matured=not args.include_matured,
             )
@@ -634,6 +653,264 @@ def cmd_borrower_update(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 — Report commands
+# ---------------------------------------------------------------------------
+
+def cmd_report_last_financials(args: argparse.Namespace) -> int:
+    """
+    Show when each watchlist borrower last published a financial statement.
+    Flags borrowers that are past their filing deadline.
+    """
+    from datetime import date as date_type
+    from src.db.engine import Session
+    from src.db.repositories.borrower import BorrowerRepository
+    from src.db.repositories.document import DocumentRepository
+    from src.distress.late_filing import compute_deadline, DEFAULT_DEADLINE_DAYS
+
+    today = date_type.today()
+
+    with Session() as session:
+        borrower_repo = BorrowerRepository(session)
+        doc_repo = DocumentRepository(session)
+        borrowers = borrower_repo.list_watchlist(order_by_score=False)
+
+        if not borrowers:
+            print("No watchlist borrowers found.")
+            return 0
+
+        print(f"\nLAST FINANCIAL FILING — {today}")
+        print("═" * 80)
+        print(
+            f"  {'ID':>4}  {'Borrower':<42}  {'FYE':>5}  {'Last Filed':<12}  Status"
+        )
+        print("  " + "-" * 76)
+
+        for b in borrowers:
+            latest = doc_repo.latest_financial_statement(b.borrower_id)
+            last_filed = (latest.posted_date or latest.doc_date) if latest else None
+            counts = doc_repo.count_for_borrower(b.borrower_id)
+            fs_count = counts.get("financial_statement", 0)
+            has_undated = (fs_count > 0 and last_filed is None)
+
+            if not b.fiscal_year_end:
+                status_str = "— no FYE set"
+            elif has_undated:
+                fye_date, deadline = compute_deadline(b.fiscal_year_end, DEFAULT_DEADLINE_DAYS, today)
+                if deadline < today:
+                    status_str = f"? Date unknown ({fs_count} docs on file)"
+                else:
+                    days_left = (deadline - today).days
+                    status_str = f"→ Due in {days_left}d ({fs_count} docs)"
+            else:
+                fye_date, deadline = compute_deadline(b.fiscal_year_end, DEFAULT_DEADLINE_DAYS, today)
+                if last_filed and last_filed > fye_date:
+                    status_str = "✓ Current"
+                elif deadline < today:
+                    days_late = (today - deadline).days
+                    status_str = f"⚠  LATE ({days_late}d overdue)"
+                else:
+                    days_left = (deadline - today).days
+                    status_str = f"→ Due in {days_left}d"
+
+            filed_str = str(last_filed) if last_filed else f"— ({fs_count} undated)" if fs_count else "—"
+            fye_str = b.fiscal_year_end or "—"
+            print(
+                f"  {b.borrower_id:>4}  {b.borrower_name:<42.42}  {fye_str:>5}  "
+                f"{filed_str:<12}  {status_str}"
+            )
+
+        # Summary — use scan_all_watchlist for accurate counts
+        from src.distress.late_filing import scan_all_watchlist
+        scan_results = scan_all_watchlist(session, today)
+        late_count = sum(1 for r in scan_results if r.is_late)
+        undated_count = sum(1 for r in scan_results if r.has_undated_filings)
+        no_fye = sum(1 for r in scan_results if r.no_fye_set)
+
+        print("  " + "═" * 76)
+        print(
+            f"\n  {len(borrowers)} tracked borrowers  |  "
+            f"{late_count} confirmed late  |  "
+            f"{undated_count} date unknown  |  "
+            f"{no_fye} without FYE"
+        )
+        print()
+
+    return 0
+
+
+def cmd_report_late_filings(args: argparse.Namespace) -> int:
+    """
+    Show borrowers that are past their annual disclosure deadline.
+    Also surfaces borrowers with undated filings that need date backfill.
+    """
+    from datetime import date as date_type
+    from src.db.engine import Session
+    from src.distress.late_filing import scan_all_watchlist
+
+    today = date_type.today()
+
+    with Session() as session:
+        results = scan_all_watchlist(session, today)
+
+    late = [r for r in results if r.is_late]
+    undated = [r for r in results if r.has_undated_filings]
+    no_fye = [r for r in results if r.no_fye_set]
+    current = [r for r in results if not r.is_late and not r.has_undated_filings and not r.no_fye_set]
+
+    print(f"\nLATE FILING REPORT — {today}")
+    print("═" * 95)
+
+    if late:
+        print(f"\n  ⚠  CONFIRMED LATE ({len(late)}) — deadline passed, no filings on record:")
+        print(
+            f"  {'ID':>4}  {'Borrower':<40}  {'FYE':>5}  {'FYE Date':<11}  "
+            f"{'Deadline':<11}  {'Last Filed':<12}  {'Days Late':>9}"
+        )
+        print("  " + "-" * 91)
+        for r in late:
+            filed_str = str(r.last_filed_date) if r.last_filed_date else "—"
+            print(
+                f"  {r.borrower_id:>4}  {r.borrower_name:<40.40}  {r.fiscal_year_end:>5}  "
+                f"{str(r.fye_date):<11}  {str(r.deadline):<11}  "
+                f"{filed_str:<12}  {r.days_overdue:>9}"
+            )
+
+    if undated:
+        print(f"\n  ?  DATE UNKNOWN ({len(undated)}) — filings on record but dates not scraped:")
+        print(
+            f"  {'ID':>4}  {'Borrower':<40}  {'FYE':>5}  {'Deadline':<11}  "
+            f"{'# Filings':>9}  Note"
+        )
+        print("  " + "-" * 83)
+        for r in undated:
+            overdue_note = f"deadline passed {(today - r.deadline).days}d ago" if r.deadline < today else f"due in {(r.deadline - today).days}d"
+            print(
+                f"  {r.borrower_id:>4}  {r.borrower_name:<40.40}  {r.fiscal_year_end:>5}  "
+                f"{str(r.deadline):<11}  {r.total_fs_count:>9}  {overdue_note}"
+            )
+        print(f"\n  → Date backfill needed. EMMA's 'Financial Operating Filing' titles")
+        print(f"    do not include dates. Dates will be available after Phase 4 PDF extraction.")
+
+    if current:
+        print(f"\n  ✓  CURRENT ({len(current)}) — filed after most recent FYE:")
+        for r in current:
+            print(f"    #{r.borrower_id:>3}  {r.borrower_name:<45}  last filed: {r.last_filed_date}")
+
+    if no_fye:
+        print(f"\n  —  NO FYE SET ({len(no_fye)}):")
+        for r in no_fye:
+            print(f"    #{r.borrower_id:>3}  {r.borrower_name}")
+        print(f"  → Run: python -m src.scraper.cli borrower update <id> --fye MM-DD")
+
+    print("\n  " + "═" * 91)
+    print(
+        f"\n  {len(results)} total  |  {len(late)} confirmed late  |  "
+        f"{len(undated)} date unknown  |  {len(current)} current  |  {len(no_fye)} no FYE\n"
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Monitor commands
+# ---------------------------------------------------------------------------
+
+def cmd_monitor_scan(args: argparse.Namespace) -> int:
+    """
+    Run the late-filing detector across all watchlist borrowers.
+
+    --dry-run    : Show results without writing anything to the database (default).
+    --write-events: Write late_filing Event records and update distress scores.
+    """
+    from datetime import date as date_type
+    from src.db.engine import Session
+    from src.distress.late_filing import scan_all_watchlist, _severity_for_days, _distress_score_contribution
+    from src.db.repositories.borrower import BorrowerRepository, VALID_DISTRESS_STATUSES
+
+    dry_run = not args.write_events
+    today = date_type.today()
+
+    mode_label = "DRY RUN" if dry_run else "LIVE SCAN"
+    print(f"\nLATE FILING SCAN [{mode_label}] — {today}")
+    print("═" * 70)
+
+    with Session() as session:
+        results = scan_all_watchlist(session, today)
+        late = [r for r in results if r.is_late]
+        current = [r for r in results if not r.is_late and not r.no_fye_set and not r.has_undated_filings]
+        no_fye = [r for r in results if r.no_fye_set]
+
+        print(f"\n  Scanned {len(results)} borrowers  →  "
+              f"{len(late)} confirmed late  |  {len(current)} current  |  {len(no_fye)} no FYE\n")
+
+        if late:
+            print(f"  {'ID':>4}  {'Borrower':<40}  {'Days Late':>9}  {'Severity':<10}  Score+")
+            print("  " + "-" * 70)
+            for r in late:
+                sev = _severity_for_days(r.days_overdue)
+                score_add = _distress_score_contribution(r.days_overdue)
+                print(
+                    f"  {r.borrower_id:>4}  {r.borrower_name:<40.40}  "
+                    f"{r.days_overdue:>9}  {sev:<10}  +{score_add}"
+                )
+
+        if not dry_run and late:
+            from src.db.repositories.event import EventRepository
+
+            event_repo = EventRepository(session)
+            borrower_repo = BorrowerRepository(session)
+
+            written = 0
+            for r in late:
+                # Write late_filing event (idempotent)
+                event_repo.upsert_late_filing(
+                    borrower_id=r.borrower_id,
+                    event_date=r.deadline,
+                    days_overdue=r.days_overdue,
+                    last_filed_date=r.last_filed_date,
+                )
+                # Update distress score
+                # SET (not accumulate) the late-filing score contribution so
+                # running this command multiple times is idempotent.
+                # Phase 5 will introduce a full multi-signal scorer.
+                score = _distress_score_contribution(r.days_overdue)
+                borrower = borrower_repo.get(r.borrower_id)
+                if borrower:
+                    # Determine status from score
+                    if score >= 50:
+                        new_status = "distressed"
+                    elif score >= 20:
+                        new_status = "watch"
+                    else:
+                        new_status = "monitor"
+                    borrower_repo.update_distress_status(
+                        r.borrower_id, new_status, score
+                    )
+                written += 1
+
+            session.commit()
+            print(f"\n  ✓ Wrote {written} late_filing event(s) to the database.")
+            print(f"  ✓ Updated distress scores for {written} borrower(s).")
+        elif dry_run and late:
+            print(f"\n  → Dry run: {len(late)} event(s) would be written. "
+                  f"Run with --write-events to persist.")
+
+        undated = [r for r in results if r.has_undated_filings]
+        if undated:
+            print(f"\n  ?  {len(undated)} borrower(s) have filings on record but without dates:")
+            for r in undated:
+                print(f"      #{r.borrower_id:>3}  {r.borrower_name:<45}  ({r.total_fs_count} docs)")
+            print(f"     → Cannot confirm late or current. Needs Phase 4 date backfill.")
+
+        if no_fye:
+            print(f"\n  —  {len(no_fye)} borrower(s) have no FYE set (cannot assess):")
+            for r in no_fye:
+                print(f"      #{r.borrower_id:>3}  {r.borrower_name}")
+
+        print()
+    return 0
+
+
 def _print_borrower(b) -> None:
     """Pretty-print a single Borrower record."""
     print(f"  ID             : {b.borrower_id}")
@@ -663,6 +940,34 @@ def _print_queue_stats(queue, verbose: bool = False) -> None:
     print(f"  Total      : {stats['total']}")
     if verbose:
         print(f"  Queue file : {stats['queue_file']}")
+
+
+# ---------------------------------------------------------------------------
+# Config command
+# ---------------------------------------------------------------------------
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Show current configuration and check storage accessibility."""
+    from src.config import settings
+
+    print(settings.summary())
+
+    if not settings.storage_is_ready():
+        print("\n⚠️  Storage directory is NOT accessible.")
+        print("   If using an external drive, make sure it is connected and mounted.")
+        print("   Set EMMA_STORAGE_DIR in your .env file to the drive's mount path.\n")
+        print("   Example (.env):")
+        print("     EMMA_STORAGE_DIR=/Volumes/EmmaArchive/raw_documents")
+        return 1
+    else:
+        from src.scraper.storage import DocumentStorage
+        store = DocumentStorage()
+        stats = store.get_stats()
+        print(
+            f"  documents stored:     {stats['total_documents']:,}\n"
+            f"  total size:           {stats['total_size_mb']:.1f} MB\n"
+        )
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +1079,56 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- db init ---
     p_initdb = subparsers.add_parser("initdb", help="Create database tables (run once)")
     p_initdb.set_defaults(func=cmd_initdb)
+
+    # --- config ---
+    p_config = subparsers.add_parser(
+        "config",
+        help="Show current configuration and check storage accessibility",
+    )
+    p_config.set_defaults(func=cmd_config)
+
+    # --- report ---
+    p_report = subparsers.add_parser(
+        "report",
+        help="Phase 3 read-only filing status reports",
+    )
+    report_sub = p_report.add_subparsers(title="reports", metavar="REPORT")
+
+    # report last-financials
+    p_rlf = report_sub.add_parser(
+        "last-financials",
+        help="Show when each borrower last published a financial statement",
+    )
+    p_rlf.set_defaults(func=cmd_report_last_financials)
+
+    # report late-filings
+    p_rlate = report_sub.add_parser(
+        "late-filings",
+        help="Show borrowers past their annual disclosure deadline (FYE + 180 days)",
+    )
+    p_rlate.set_defaults(func=cmd_report_late_filings)
+
+    # --- monitor ---
+    p_monitor = subparsers.add_parser(
+        "monitor",
+        help="Phase 3 surveillance actions",
+    )
+    monitor_sub = p_monitor.add_subparsers(title="actions", metavar="ACTION")
+
+    # monitor scan
+    p_mscan = monitor_sub.add_parser(
+        "scan",
+        help="Run late-filing detector across all watchlist borrowers",
+    )
+    p_mscan.add_argument(
+        "--write-events",
+        action="store_true",
+        help=(
+            "Write late_filing Event records to the database and update "
+            "distress scores (default: dry run, no writes)"
+        ),
+    )
+    p_mscan.set_defaults(func=cmd_monitor_scan)
 
     # --- borrower ---
     p_borrower = subparsers.add_parser("borrower", help="Manage tracked borrowers")

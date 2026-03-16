@@ -11,11 +11,25 @@ This is the core monitoring endpoint — called daily for watchlist borrowers.
 
 Key features:
   - Incremental update: stops collecting documents posted on or before
-    last_seen_date (using doc_date as a proxy since HTML has no explicit
-    posted_date)
+    last_seen_date (using posted_date as the cursor)
   - Skips "(Archived)" links (superseded document versions)
   - Parses doc_type and doc_date from link text
+  - Extracts posted_date from the second <td> in each table row
   - Generates a stable doc_id from the PDF filename
+
+HTML table structure observed on EMMA's /IssueView/Details page:
+  <table id="submissionFileListArchiveTable">
+    <thead>
+      <tr><th>Document</th><th>Posting Date</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><a href="/P22019369-....pdf">Financial Operating Filing (1.2 MB)</a></td>
+        <td>03/10/2026</td>    ← this is the posted_date we extract
+      </tr>
+      ...
+    </tbody>
+  </table>
 
 PDF link text examples observed on EMMA:
   "Financial Operating Filing (323 KB)"
@@ -88,11 +102,10 @@ def fetch_disclosure_documents(
     Args:
         session:        Active requests.Session (must have Disclaimer6 cookie set).
         issue_id:       EMMA internal issue ID.
-        last_seen_date: If provided, stop collecting documents whose doc_date is
-                        on or before this date. This implements incremental updates.
-                        Note: EMMA's Details page does not expose an explicit
-                        posted_date in the HTML, so doc_date (parsed from the
-                        link text) is used as a proxy.
+        last_seen_date: If provided, stop collecting documents whose posted_date
+                        is on or before this date. This implements incremental
+                        updates. posted_date is extracted from the "Posting Date"
+                        column in EMMA's document archive table.
         use_cache:      Whether to use the 24-hour response cache.
                         Set to False for real-time monitoring runs.
 
@@ -115,7 +128,7 @@ def fetch_disclosure_documents(
 
     docs = _extract_pdf_links(html, issue_id)
 
-    # Apply incremental filter using doc_date as posted_date proxy
+    # Apply incremental filter using posted_date (from EMMA's "Posting Date" column)
     if last_seen_date is not None:
         new_docs: list[DisclosureDocument] = []
         for doc in docs:
@@ -148,12 +161,11 @@ def get_latest_posted_date(docs: list[DisclosureDocument]) -> Optional[datetime]
     """
     Return the most recent posted_date from a list of documents.
 
-    Since the Details page does not expose a true posted_date, this returns
-    the most recent doc_date converted to datetime (used as a proxy cursor).
+    Uses posted_date (extracted from EMMA's "Posting Date" column) as the
+    primary cursor; falls back to doc_date only if posted_date is absent.
 
     Use this to update the last_seen_date cursor after a successful fetch.
     """
-    # Prefer explicit posted_date; fall back to doc_date
     candidates: list[datetime] = []
     for d in docs:
         if d.posted_date is not None:
@@ -171,13 +183,21 @@ def _extract_pdf_links(html: str, issue_id: str) -> list[DisclosureDocument]:
     """
     Extract all disclosure document PDF links from an /IssueView/Details page.
 
-    EMMA embeds PDF links as <a href="/Pxxx-Pyyy-Pzzz.pdf">Link Text</a>.
-    The link text encodes both the document type and the document date.
+    EMMA embeds PDF links in a two-column table:
+        <tr>
+          <td><a href="/Pxxx-Pyyy-Pzzz.pdf">Financial Operating Filing (323 KB)</a></td>
+          <td>03/10/2026</td>   ← Posting Date column
+        </tr>
+
+    The link text encodes the document type (and sometimes the document date
+    for event notices).  The second <td> sibling always holds the posting date
+    (the date EMMA received the filing) — this is what we store as posted_date.
 
     Links containing "(Archived)" in their text are skipped — these are
     superseded versions of documents that have been replaced by later filings.
 
-    Results are sorted newest first by doc_date (None-dated docs go last).
+    Results are sorted newest first by posted_date (falling back to doc_date
+    for any documents where the posting date could not be extracted).
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -219,24 +239,39 @@ def _extract_pdf_links(html: str, issue_id: str) -> list[DisclosureDocument]:
         doc_type = _classify_doc_type(link_text)
         doc_date = _extract_doc_date(link_text)
 
+        # Extract the posting date from the sibling <td> in the same table row.
+        # EMMA renders each document as: <tr><td>[PDF link]</td><td>MM/DD/YYYY</td></tr>
+        posted_date: Optional[date] = None
+        parent_td = link.parent
+        if parent_td and parent_td.name == "td":
+            parent_tr = parent_td.parent
+            if parent_tr and parent_tr.name == "tr":
+                cells = parent_tr.find_all("td")
+                if len(cells) >= 2:
+                    raw_posted = cells[1].get_text(strip=True)
+                    posted_date = _parse_date(raw_posted)
+
         docs.append(DisclosureDocument(
             doc_id=doc_id,
             issue_id=issue_id,
             doc_type=doc_type,
             doc_date=doc_date,
-            # The Details page HTML does not expose a separate posted_date.
-            # doc_date (from link text) is used as the incremental cursor proxy.
-            posted_date=None,
+            posted_date=datetime(posted_date.year, posted_date.month, posted_date.day)
+                        if posted_date else None,
             title=link_text,
             doc_url=doc_url,
             submitter=None,
         ))
 
-    # Sort newest first: docs with doc_date before docs without, then by date desc
-    docs.sort(
-        key=lambda d: d.doc_date or date.min,
-        reverse=True,
-    )
+    # Sort newest first: use posted_date as primary sort key, fall back to doc_date
+    def sort_key(d: DisclosureDocument):
+        if d.posted_date is not None:
+            return d.posted_date
+        if d.doc_date is not None:
+            return datetime(d.doc_date.year, d.doc_date.month, d.doc_date.day)
+        return datetime.min
+
+    docs.sort(key=sort_key, reverse=True)
 
     logger.debug(
         "Extracted %d PDF disclosure links for issue %s", len(docs), issue_id

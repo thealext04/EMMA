@@ -21,13 +21,21 @@ psycopg2-binary>=2.9.0    # PostgreSQL driver (not needed if using SQLite)
 # alembic>=1.13.0          # Database migrations — add when schema stabilises
 
 # ---------------------------------------------------------------------------
-# Phase 4 — AI Parsing (install when starting Phase 4)
+# Phase 3 — Configuration
 # ---------------------------------------------------------------------------
 
-# anthropic>=0.25.0        # Claude API client
-# pdfplumber>=0.10.0       # PDF text extraction
-# pytesseract>=0.3.10      # OCR fallback for scanned PDFs
-# Pillow>=10.0.0           # Image handling for OCR
+python-dotenv>=1.0.0      # Load .env file for EMMA_STORAGE_DIR, API keys, etc.
+
+# ---------------------------------------------------------------------------
+# Phase 4 — AI Parsing
+# ---------------------------------------------------------------------------
+
+anthropic>=0.25.0         # Claude API client (claude-sonnet-4-6, claude-haiku-4-5)
+pdfplumber>=0.10.0        # PDF text extraction (text-based PDFs)
+pytesseract>=0.3.10       # OCR fallback for scanned/image-based PDFs
+Pillow>=10.0.0            # Image handling required by pytesseract
+pdf2image>=1.17.0         # Convert PDF pages to images for OCR
+pydantic>=2.0.0           # Structured output validation for AI responses
 
 # ---------------------------------------------------------------------------
 # Development & Testing

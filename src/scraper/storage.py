@@ -28,10 +28,21 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Base storage directory relative to project root
-DEFAULT_STORAGE_DIR = os.path.join(
-    os.path.dirname(__file__), "..", "..", "data", "raw_documents"
-)
+
+def _default_storage_dir() -> str:
+    """
+    Return the configured storage directory, falling back to the project-local
+    data/raw_documents/ if EMMA_STORAGE_DIR is not set.
+
+    Reading from settings here (rather than a module-level constant) ensures
+    that .env is loaded before the path is resolved.
+    """
+    try:
+        from src.config import settings  # noqa: PLC0415
+        return settings.storage_dir
+    except Exception:
+        # Fallback if config is unavailable (e.g., during early bootstrapping)
+        return os.path.join(os.path.dirname(__file__), "..", "..", "data", "raw_documents")
 
 
 def slugify(text: str) -> str:
@@ -52,8 +63,8 @@ class DocumentStorage:
     Manages the raw document file tree.
     """
 
-    def __init__(self, base_dir: str = DEFAULT_STORAGE_DIR) -> None:
-        self.base_dir = os.path.abspath(base_dir)
+    def __init__(self, base_dir: Optional[str] = None) -> None:
+        self.base_dir = os.path.abspath(base_dir or _default_storage_dir())
         os.makedirs(self.base_dir, exist_ok=True)
 
     def get_path(

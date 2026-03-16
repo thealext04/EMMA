@@ -200,6 +200,24 @@ class BorrowerRepository:
         stmt = select(Borrower).order_by(Borrower.borrower_name)
         return list(self.session.execute(stmt).scalars())
 
+    def list_with_fye(self) -> list[Borrower]:
+        """
+        Return all on-watchlist borrowers that have fiscal_year_end set.
+
+        Used by the late-filing scanner to find borrowers for which a
+        deadline can be computed.  Borrowers without an FYE are excluded
+        (they will be flagged separately in the report).
+        """
+        stmt = (
+            select(Borrower)
+            .where(
+                Borrower.on_watchlist == True,  # noqa: E712
+                Borrower.fiscal_year_end != None,  # noqa: E711
+            )
+            .order_by(Borrower.borrower_name)
+        )
+        return list(self.session.execute(stmt).scalars())
+
     def count(self) -> int:
         """Return total number of borrowers."""
         stmt = select(func.count()).select_from(Borrower)

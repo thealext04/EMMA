@@ -275,14 +275,24 @@ class DocumentRepository:
         return {row.doc_type: row.n for row in rows}
 
     def latest_financial_statement(self, borrower_id: int) -> Optional[Document]:
-        """Return the most recently posted financial statement for a borrower."""
+        """
+        Return the most recently dated financial statement for a borrower.
+
+        Orders by COALESCE(posted_date, doc_date) DESC so that documents
+        work correctly whether the scraper populated posted_date, doc_date,
+        or both.  (Currently the scraper stores doc_date from the document
+        title's "as of" date; posted_date is populated only when EMMA
+        provides it explicitly.)
+        """
+        from sqlalchemy import func as sqlfunc
+        effective_date = sqlfunc.coalesce(Document.posted_date, Document.doc_date)
         stmt = (
             select(Document)
             .where(
                 Document.borrower_id == borrower_id,
                 Document.doc_type == "financial_statement",
             )
-            .order_by(Document.posted_date.desc().nulls_last())
+            .order_by(effective_date.desc().nulls_last())
             .limit(1)
         )
         return self.session.execute(stmt).scalar_one_or_none()
