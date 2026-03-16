@@ -329,6 +329,10 @@ class ExtractedMetrics(Base):
     period_type             = Column(Text)          # 'annual' | 'interim' | 'unknown'
     period_months           = Column(Integer)       # months covered: 12=annual, 6=semi-annual, 3=quarterly
 
+    # Source tracking — one metrics row may be built from multiple PDFs
+    # (e.g. main audited financials + compliance certificate filed same day)
+    source_doc_ids          = Column(Text)          # comma-separated doc_ids that contributed to this row
+
     # Extraction metadata
     extraction_model        = Column(Text)
     extraction_confidence   = Column(Text)

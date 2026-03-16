@@ -1,24 +1,26 @@
 """
 repositories/metrics.py — Data-access layer for the extracted_metrics table.
 
-Stores structured financial data extracted by the Phase 4 AI pipeline.
-One row per document (idempotent on doc_id — safe to re-run extraction).
+Deduplication strategy
+-----------------------
+EMMA frequently posts multiple documents for the same filing date — e.g. the
+main audited financials AND a compliance certificate filed the same day.  Both
+are tagged financial_statement and both cover the same fiscal year.
 
-Usage:
-    from src.db.repositories.metrics import MetricsRepository
-    from src.parser.extractor import FinancialMetrics, HigherEdMetrics
+To avoid duplicate rows, upsert() uses a two-pass lookup:
 
-    repo = MetricsRepository(session)
-    record, created = repo.upsert(
-        doc_id=42,
-        borrower_id=5,
-        metrics=financial_metrics,
-        sector_metrics=higher_ed_metrics,
-        extraction_model="claude-sonnet-4-6",
-        extraction_confidence="high",
-        raw_json='{"fiscal_year_end": "2025-06-30", ...}',
-    )
-    session.commit()
+  1. Check by doc_id (exact re-extraction of the same PDF)
+  2. For annual docs: check by (borrower_id, period_end_date, period_type='annual')
+     — if a row already exists for that fiscal year, MERGE by filling nulls only.
+     Existing non-null values are never overwritten by a later, less complete doc.
+
+This produces one canonical row per borrower per fiscal year that accumulates
+the best available data across all PDFs filed for that period.  The
+source_doc_ids column records every document that contributed to the row.
+
+Interim docs (period_type='interim') are stored one row per doc_id as usual
+because snapshot metrics (cash, debt, enrollment) are genuinely different
+point-in-time observations.
 """
 
 import logging
@@ -54,80 +56,119 @@ class MetricsRepository:
         raw_json: str = "",
     ) -> tuple[ExtractedMetrics, bool]:
         """
-        Insert or update an extracted_metrics record for a document.
+        Insert or merge an extracted_metrics record.
 
-        Idempotent on doc_id — if the document has already been extracted,
-        the existing record is updated with the new values (enables re-extraction
-        as AI models improve).
+        Lookup priority:
+          1. Exact doc_id match — re-extraction of the same PDF overwrites fully.
+          2. Annual docs only: match on (borrower_id, period_end_date, 'annual').
+             If a row for this fiscal year already exists, FILL NULLS only —
+             never overwrite a populated field with a null from a thinner doc.
+          3. No match — create new row.
 
-        Args:
-            doc_id:                 Primary key of the source Document.
-            borrower_id:            Primary key of the borrower.
-            metrics:                FinancialMetrics Pydantic model from extractor.py.
-            sector_metrics:         HigherEdMetrics or HealthcareMetrics (optional).
-            extraction_model:       Model name used (e.g. "claude-sonnet-4-6").
-            extraction_confidence:  "high" | "medium" | "low"
-            raw_json:               Raw AI response JSON string (for audit/reprocessing).
+        source_doc_ids accumulates every doc_id that contributed data.
 
         Returns:
             (ExtractedMetrics, created) where created=True if a new row was inserted.
         """
-        existing = self.session.execute(
+        from sqlalchemy import and_  # noqa: PLC0415
+
+        # Pass 1: exact doc_id (re-extraction)
+        record = self.session.execute(
             select(ExtractedMetrics).where(ExtractedMetrics.doc_id == doc_id)
         ).scalar_one_or_none()
+        created = False
+        merge_mode = False  # True = fill-nulls only, False = full overwrite
 
-        if existing:
-            record = existing
-            created = False
-            logger.debug("Updating existing metrics record for doc_id=%d", doc_id)
-        else:
+        if record:
+            logger.debug("Re-extracting existing record for doc_id=%d", doc_id)
+
+        # Pass 2: annual dedup — find existing row for same borrower + fiscal year
+        elif (
+            metrics.period_type == "annual"
+            and metrics.fiscal_year_end is not None
+        ):
+            record = self.session.execute(
+                select(ExtractedMetrics).where(
+                    and_(
+                        ExtractedMetrics.borrower_id == borrower_id,
+                        ExtractedMetrics.period_end_date == metrics.fiscal_year_end,
+                        ExtractedMetrics.period_type == "annual",
+                    )
+                )
+            ).scalar_one_or_none()
+            if record:
+                merge_mode = True
+                logger.debug(
+                    "Merging doc_id=%d into existing annual record "
+                    "(borrower=%d FY=%s) — filling nulls only",
+                    doc_id, borrower_id, metrics.fiscal_year_end,
+                )
+
+        # Pass 3: create new row
+        if record is None:
             record = ExtractedMetrics(doc_id=doc_id, borrower_id=borrower_id)
             self.session.add(record)
             created = True
             logger.debug("Creating new metrics record for doc_id=%d", doc_id)
 
-        # --- Period context ---
-        record.period_type   = metrics.period_type    # 'annual' | 'interim' | 'unknown'
-        record.period_months = metrics.period_months  # 12, 6, 3, etc.
+        # Track all source documents that contributed to this row
+        existing_ids = set(
+            (record.source_doc_ids or "").split(",")
+        ) - {""}
+        existing_ids.add(str(doc_id))
+        record.source_doc_ids = ",".join(sorted(existing_ids, key=int))
+
+        def _set(field: str, value) -> None:
+            """
+            Set a field on the record.
+            In merge_mode: only write if the current value is None (fill nulls only).
+            In normal mode: always write (full overwrite on re-extraction).
+            """
+            if merge_mode and getattr(record, field) is not None:
+                return  # existing non-null value wins
+            if value is not None:
+                setattr(record, field, value)
+
+        # --- Period context (always overwrite — period doesn't change) ---
+        record.period_type   = metrics.period_type
+        record.period_months = metrics.period_months
 
         # --- Core financial metrics ---
         if metrics.fiscal_year_end:
             record.period_end_date = metrics.fiscal_year_end
             record.fiscal_year = metrics.fiscal_year_end.year
 
-        # Flow metrics (revenue, income) — only meaningful for full-year periods.
-        # Claude nulls these out for interim filings per the extraction prompt.
-        record.total_revenue           = metrics.total_revenue
-        record.operating_revenue       = metrics.operating_revenue
-        record.net_income              = metrics.net_income
-        record.operating_income        = metrics.operating_income
-        record.ebitda                  = metrics.ebitda
+        # Flow metrics — Claude nulls these for interim filings.
+        _set("total_revenue",           metrics.total_revenue)
+        _set("operating_revenue",       metrics.operating_revenue)
+        _set("net_income",              metrics.net_income)
+        _set("operating_income",        metrics.operating_income)
+        _set("ebitda",                  metrics.ebitda)
 
-        # Snapshot / point-in-time metrics — valid for any period type.
-        record.days_cash_on_hand       = metrics.days_cash_on_hand
-        record.cash_and_investments    = metrics.cash_and_investments
-        record.unrestricted_net_assets = metrics.unrestricted_net_assets
-        record.total_long_term_debt    = metrics.total_long_term_debt
-        record.annual_debt_service     = metrics.annual_debt_service
-        record.dscr                    = metrics.dscr
+        # Snapshot metrics — point-in-time, valid for any period type.
+        _set("days_cash_on_hand",       metrics.days_cash_on_hand)
+        _set("cash_and_investments",    metrics.cash_and_investments)
+        _set("unrestricted_net_assets", metrics.unrestricted_net_assets)
+        _set("total_long_term_debt",    metrics.total_long_term_debt)
+        _set("annual_debt_service",     metrics.annual_debt_service)
+        _set("dscr",                    metrics.dscr)
 
         # --- Sector-specific metrics ---
         if sector_metrics is not None:
-            # Import here to avoid circular at module level
             from src.parser.extractor import HigherEdMetrics, HealthcareMetrics  # noqa: PLC0415
 
             if isinstance(sector_metrics, HigherEdMetrics):
-                record.total_enrollment      = sector_metrics.total_enrollment
-                record.fte_enrollment        = sector_metrics.fte_enrollment
-                record.tuition_revenue       = sector_metrics.tuition_revenue
-                record.tuition_discount_rate = sector_metrics.tuition_discount_rate
-                record.endowment_value       = sector_metrics.endowment_value
+                _set("total_enrollment",      sector_metrics.total_enrollment)
+                _set("fte_enrollment",        sector_metrics.fte_enrollment)
+                _set("tuition_revenue",       sector_metrics.tuition_revenue)
+                _set("tuition_discount_rate", sector_metrics.tuition_discount_rate)
+                _set("endowment_value",       sector_metrics.endowment_value)
 
             elif isinstance(sector_metrics, HealthcareMetrics):
-                record.licensed_beds      = sector_metrics.licensed_beds
-                record.staffed_beds       = sector_metrics.staffed_beds
-                record.patient_admissions = sector_metrics.patient_admissions
-                record.patient_days       = sector_metrics.patient_days
+                _set("licensed_beds",       sector_metrics.licensed_beds)
+                _set("staffed_beds",        sector_metrics.staffed_beds)
+                _set("patient_admissions",  sector_metrics.patient_admissions)
+                _set("patient_days",        sector_metrics.patient_days)
                 record.net_patient_revenue = sector_metrics.net_patient_revenue
                 record.days_ar            = sector_metrics.days_ar
 
