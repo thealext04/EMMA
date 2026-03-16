@@ -29,18 +29,41 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def _load_dotenv() -> None:
     """
-    Load .env from the project root if python-dotenv is installed.
-    Silently skips if the package is not available or file doesn't exist.
+    Load .env from the project root into os.environ.
+
+    Uses python-dotenv if available; falls back to a simple manual parser
+    that handles KEY=VALUE lines (no quotes required, # comments stripped).
+    Values already present in os.environ are NOT overwritten.
     """
     env_file = PROJECT_ROOT / ".env"
     if not env_file.exists():
         return
+
+    # Try python-dotenv first
     try:
         from dotenv import load_dotenv  # type: ignore[import]
-        load_dotenv(env_file)
-        logger.debug("Loaded .env from %s", env_file)
+        load_dotenv(env_file, override=True)  # override=True ensures fresh reads
+        logger.debug("Loaded .env via python-dotenv from %s", env_file)
+        return
     except ImportError:
-        # python-dotenv not installed — fall back to OS environment only
+        pass
+    except Exception:
+        pass
+
+    # Manual fallback: parse KEY=VALUE lines directly
+    try:
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+        logger.debug("Loaded .env manually from %s", env_file)
+    except Exception:
         pass
 
 

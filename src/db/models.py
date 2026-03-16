@@ -325,9 +325,14 @@ class ExtractedMetrics(Base):
     net_patient_revenue     = Column(Numeric(18, 2))
     days_ar                 = Column(Numeric(8, 2))
 
+    # Period context — critical for comparing figures across documents
+    period_type             = Column(Text)          # 'annual' | 'interim' | 'unknown'
+    period_months           = Column(Integer)       # months covered: 12=annual, 6=semi-annual, 3=quarterly
+
     # Extraction metadata
     extraction_model        = Column(Text)
     extraction_confidence   = Column(Text)
+    raw_json                = Column(Text)          # Full AI response — for audit and reprocessing
     extracted_at            = Column(DateTime, default=func.now())
 
     # Relationships

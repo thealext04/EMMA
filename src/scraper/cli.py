@@ -19,6 +19,12 @@ Phase 3 Commands:
     monitor     Surveillance actions
       scan             Run the late-filing detector; optionally write events to DB
 
+Phase 4 Commands:
+    parse       AI extraction pipeline (Claude Sonnet — streams PDFs, no local storage)
+      status           Show extraction_status counts by doc_type
+      run              Run extraction on pending documents
+      borrower <id>    Run extraction for all pending docs for one borrower
+
 Usage:
     python -m src.scraper.cli search "Manhattan College"
     python -m src.scraper.cli search "Rider University" --state NJ
@@ -971,6 +977,147 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Parse commands (Phase 4 — AI extraction pipeline)
+# ---------------------------------------------------------------------------
+
+def cmd_parse_status(args: argparse.Namespace) -> int:
+    """Show extraction_status counts across all documents."""
+    from src.db.engine import Session
+    from src.db.models import Document
+    from sqlalchemy import select, func
+
+    with Session() as session:
+        rows = session.execute(
+            select(Document.doc_type, Document.extraction_status, func.count().label("n"))
+            .group_by(Document.doc_type, Document.extraction_status)
+            .order_by(Document.doc_type, Document.extraction_status)
+        ).all()
+
+    # Pivot into a display table
+    types = sorted({r.doc_type for r in rows})
+    statuses = ["pending", "extracted", "skipped", "failed"]
+
+    data: dict[str, dict[str, int]] = {t: {s: 0 for s in statuses} for t in types}
+    for r in rows:
+        if r.extraction_status in statuses:
+            data[r.doc_type][r.extraction_status] = r.n
+
+    total_pending = sum(data[t]["pending"] for t in types)
+
+    print(f"\nEXTRACTION STATUS — {datetime.now().date()}")
+    print("═" * 75)
+    print(f"{'doc_type':<26} {'pending':>9} {'extracted':>10} {'skipped':>8} {'failed':>7}")
+    print("-" * 75)
+    for t in types:
+        d = data[t]
+        print(
+            f"{t:<26} {d['pending']:>9,} {d['extracted']:>10,} "
+            f"{d['skipped']:>8,} {d['failed']:>7,}"
+        )
+    print("-" * 75)
+    print(f"{'TOTAL PENDING':<26} {total_pending:>9,}")
+    print()
+    return 0
+
+
+def cmd_parse_run(args: argparse.Namespace) -> int:
+    """Run the AI extraction pipeline on pending documents."""
+    from src.config import settings
+    from src.db.engine import Session
+    from src.scraper.session import EMMAsession
+    from src.parser.pipeline import ExtractionPipeline
+    import anthropic
+
+    settings.assert_api_key()
+
+    doc_type = getattr(args, "doc_type", None)
+    borrower_id = getattr(args, "borrower_id", None)
+    limit = args.limit
+    dry_run = args.dry_run
+
+    if dry_run:
+        print(f"\n[DRY RUN] Would process up to {limit} documents (no writes)")
+    else:
+        print(f"\nRunning extraction pipeline — limit={limit}", end="")
+        if doc_type:
+            print(f", doc_type={doc_type}", end="")
+        if borrower_id:
+            print(f", borrower_id={borrower_id}", end="")
+        print()
+
+    ai_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    http_session = EMMAsession().get_session()
+
+    with Session() as session:
+        pipeline = ExtractionPipeline(
+            db_session=session,
+            http_session=http_session,
+            anthropic_client=ai_client,
+        )
+        summary = pipeline.run(
+            limit=limit,
+            doc_type_filter=doc_type,
+            borrower_id=borrower_id,
+            dry_run=dry_run,
+        )
+
+    print(f"\n  Processed:       {summary.processed}")
+    print(f"  Extracted:       {summary.extracted}")
+    print(f"  Skipped:         {summary.skipped}")
+    print(f"  Failed:          {summary.failed}")
+    if summary.going_concern_found:
+        print(f"\n  ⚠️  Going concern signals: {summary.going_concern_found}")
+    if summary.dscr_breach_found:
+        print(f"  ⚠️  DSCR breach signals:   {summary.dscr_breach_found}")
+    print()
+    return 0
+
+
+def cmd_parse_borrower(args: argparse.Namespace) -> int:
+    """Run extraction for all pending documents belonging to one borrower."""
+    from src.config import settings
+    from src.db.engine import Session
+    from src.db.repositories.borrower import BorrowerRepository
+    from src.scraper.session import EMMAsession
+    from src.parser.pipeline import ExtractionPipeline
+    import anthropic
+
+    settings.assert_api_key()
+
+    with Session() as session:
+        repo = BorrowerRepository(session)
+        borrower = repo.get(args.borrower_id)
+        if not borrower:
+            print(f"Borrower ID {args.borrower_id} not found.")
+            return 1
+
+        print(
+            f"\nRunning extraction for: {borrower.borrower_name} "
+            f"(sector={borrower.sector})"
+        )
+        if args.dry_run:
+            print("[DRY RUN — no writes]")
+
+        ai_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        http_session = EMMAsession().get_session()
+
+        pipeline = ExtractionPipeline(
+            db_session=session,
+            http_session=http_session,
+            anthropic_client=ai_client,
+        )
+        summary = pipeline.run(
+            limit=args.limit,
+            doc_type_filter=getattr(args, "doc_type", None),
+            borrower_id=args.borrower_id,
+            dry_run=args.dry_run,
+        )
+
+    print(str(summary))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1129,6 +1276,67 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_mscan.set_defaults(func=cmd_monitor_scan)
+
+    # --- parse (Phase 4) ---
+    p_parse = subparsers.add_parser(
+        "parse",
+        help="Phase 4 AI extraction pipeline — extract metrics from PDFs",
+    )
+    parse_sub = p_parse.add_subparsers(title="actions", metavar="ACTION")
+
+    # parse status
+    p_pstatus = parse_sub.add_parser(
+        "status",
+        help="Show extraction_status counts by doc_type",
+    )
+    p_pstatus.set_defaults(func=cmd_parse_status)
+
+    # parse run
+    p_prun = parse_sub.add_parser(
+        "run",
+        help="Run AI extraction on pending documents",
+    )
+    p_prun.add_argument(
+        "--limit", type=int, default=50,
+        help="Maximum documents to process (default: 50)",
+    )
+    p_prun.add_argument(
+        "--doc-type",
+        dest="doc_type",
+        default=None,
+        choices=["financial_statement", "event_notice", "operating_report", "budget", "rating_notice"],
+        help="Only extract this document type",
+    )
+    p_prun.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch and extract text but do not write to DB",
+    )
+    p_prun.set_defaults(func=cmd_parse_run)
+
+    # parse borrower
+    p_pborrower = parse_sub.add_parser(
+        "borrower",
+        help="Run extraction for all pending documents for one borrower",
+    )
+    p_pborrower.add_argument("borrower_id", type=int, help="Borrower ID")
+    p_pborrower.add_argument(
+        "--limit", type=int, default=200,
+        help="Maximum documents to process (default: 200)",
+    )
+    p_pborrower.add_argument(
+        "--doc-type",
+        dest="doc_type",
+        default=None,
+        choices=["financial_statement", "event_notice", "operating_report", "budget", "rating_notice"],
+        help="Only extract this document type",
+    )
+    p_pborrower.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch and extract text but do not write to DB",
+    )
+    p_pborrower.set_defaults(func=cmd_parse_borrower)
 
     # --- borrower ---
     p_borrower = subparsers.add_parser("borrower", help="Manage tracked borrowers")
