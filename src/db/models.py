@@ -337,6 +337,7 @@ class ExtractedMetrics(Base):
     extraction_model        = Column(Text)
     extraction_confidence   = Column(Text)
     raw_json                = Column(Text)          # Full AI response — for audit and reprocessing
+    citations_json          = Column(Text)          # JSON object: {field_name: "verbatim passage"}
     extracted_at            = Column(DateTime, default=func.now())
 
     # Relationships

@@ -23,6 +23,7 @@ because snapshot metrics (cash, debt, enrollment) are genuinely different
 point-in-time observations.
 """
 
+import json
 import logging
 from datetime import datetime
 from typing import Optional, Union
@@ -33,6 +34,15 @@ from sqlalchemy.orm import Session
 from src.db.models import ExtractedMetrics
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_json_loads(s: str) -> dict:
+    """Parse a JSON string into a dict; return empty dict on any error."""
+    try:
+        result = json.loads(s)
+        return result if isinstance(result, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
 
 class MetricsRepository:
@@ -54,6 +64,7 @@ class MetricsRepository:
         extraction_model: str = "",
         extraction_confidence: str = "medium",
         raw_json: str = "",
+        citations_json: str = "",         # JSON object: {field_name: "verbatim passage"}
     ) -> tuple[ExtractedMetrics, bool]:
         """
         Insert or merge an extracted_metrics record.
@@ -180,6 +191,17 @@ class MetricsRepository:
         # Store raw JSON if the column exists (added in Phase 4 migration)
         if hasattr(record, "raw_json"):
             record.raw_json = raw_json
+
+        # Store / merge citations (field → verbatim passage from source PDF)
+        if hasattr(record, "citations_json") and citations_json:
+            if merge_mode and record.citations_json:
+                # Merge: existing citations win; incoming fills any missing fields
+                existing_citations = _safe_json_loads(record.citations_json)
+                incoming_citations = _safe_json_loads(citations_json)
+                merged = {**incoming_citations, **existing_citations}  # existing takes priority
+                record.citations_json = json.dumps(merged)
+            else:
+                record.citations_json = citations_json
 
         return record, created
 

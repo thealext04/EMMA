@@ -56,10 +56,27 @@ VALID_DOC_TYPES = {
 # "operating" and would misclassify every "Financial Operating Filing" as a
 # rating_notice.  Use full phrases like "rating action" or "credit rating" instead.
 _TYPE_KEYWORDS: list[tuple[str, list[str]]] = [
+    # --- Forced bond_issuance overrides (checked FIRST, highest priority) ---
+    # These appear in official statements and POS docs and should never enter
+    # the AI extraction pipeline regardless of any other keywords present.
+    ("bond_issuance", [
+        "official statement", "preliminary official", "offering memorandum",
+        "bond prospectus", "remarketing supplement", "plan of finance",
+        "underwriting agreement",
+    ]),
+    # --- Financial statements ---
     ("financial_statement", [
-        # EMMA's native continuing-disclosure label — highest priority
+        # EMMA's native continuing-disclosure label
         "financial operating filing",
-        # Other common patterns
+        # Unambiguous accounting statement headers (from first-page text)
+        "statement of net position",
+        "statement of activities",
+        "notes to financial statements",
+        "independent auditor",
+        "management's discussion and analysis",
+        "statement of revenues, expenses",
+        "statements of operations",         # healthcare / corporate
+        # General title patterns
         "annual financial", "audited financial", "financial statement",
         "audit report", "auditor's report", "cafr",
         "annual report", "comprehensive annual",
@@ -80,14 +97,10 @@ _TYPE_KEYWORDS: list[tuple[str, list[str]]] = [
         "annual budget", "adopted budget", "proposed budget",
     ]),
     ("rating_notice", [
-        # Precise multi-word phrases only — avoids the "oper-ating" collision
+        # Precise multi-word phrases only — avoids the "operating" collision
         "rating action", "rating change", "rating report", "rating letter",
         "credit rating", "rating agency", "rating upgrade", "rating downgrade",
         "moody", "standard & poor", "fitch",
-    ]),
-    ("bond_issuance", [
-        "official statement", "preliminary official", "offering memorandum",
-        "bond prospectus", "remarketing supplement",
     ]),
 ]
 
@@ -99,9 +112,13 @@ def classify_doc_type(title: str, emma_type_label: str = "") -> str:
     Checks _TYPE_KEYWORDS in priority order; falls back to "other".
 
     Key design decisions:
+    - bond_issuance patterns are checked FIRST so that official statements
+      containing words like "financial" or "auditor" are never misrouted
+      into the extraction pipeline.
     - "Financial Operating Filing" (EMMA's label for annual financial disclosures)
-      is matched first and explicitly, before any shorter-phrase rules.
-    - "Event Filing" (EMMA's label for material event notices) is matched first.
+      is matched explicitly in the financial_statement block.
+    - Unambiguous accounting statement headers (e.g. "Statement of Net Position")
+      are now included so first-page text can improve classification accuracy.
     - "rating" is NOT used as a bare substring keyword because it is a substring
       of "operating" — causing every financial filing to be misclassified.
     """

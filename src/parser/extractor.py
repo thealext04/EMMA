@@ -63,6 +63,76 @@ def has_going_concern_risk(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Event notice severity pre-scan
+# ---------------------------------------------------------------------------
+
+# Keywords tiered by severity — checked BEFORE AI extraction as a fast
+# signal estimate.  The AI call still runs for all event_notice documents;
+# these tiers provide early-warning logging and a fallback severity estimate
+# if AI extraction fails.
+EVENT_NOTICE_CRITICAL: list[str] = [
+    "payment default",
+    "event of default",
+    "bankruptcy",
+    "chapter 9",
+    "chapter 11",
+    "insolvency",
+    "receivership",
+    "failure to pay",
+]
+
+EVENT_NOTICE_HIGH: list[str] = [
+    "covenant violation",
+    "covenant breach",
+    "forbearance agreement",
+    "debt restructuring",
+    "acceleration",
+    "liquidity facility termination",
+    "material adverse",
+]
+
+EVENT_NOTICE_MEDIUM: list[str] = [
+    "rating downgrade",
+    "rating withdrawal",
+    "watch negative",
+    "negative outlook",
+    "covenant waiver",
+    "amendment to loan",
+    "modification of terms",
+]
+
+
+def pre_scan_event_notice(text: str) -> tuple[str, list[str]]:
+    """
+    Fast keyword pre-scan for event notice documents.
+
+    Returns:
+        (severity, matched_keywords)
+
+    severity is one of: 'critical' | 'high' | 'medium' | 'low'
+
+    This is additive — AI extraction always runs regardless of this result.
+    The returned severity can be used to log early warnings and as a
+    fallback if AI extraction fails or returns a lower-confidence result.
+    """
+    text_lower = text.lower()
+
+    for kw in EVENT_NOTICE_CRITICAL:
+        if kw in text_lower:
+            return "critical", [kw]
+
+    matched_high = [kw for kw in EVENT_NOTICE_HIGH if kw in text_lower]
+    if matched_high:
+        return "high", matched_high
+
+    matched_medium = [kw for kw in EVENT_NOTICE_MEDIUM if kw in text_lower]
+    if matched_medium:
+        return "medium", matched_medium
+
+    return "low", []
+
+
+# ---------------------------------------------------------------------------
 # Pydantic output models
 # ---------------------------------------------------------------------------
 
@@ -226,6 +296,11 @@ IMPORTANT RULES FOR FLOW METRICS (revenue, income, EBITDA):
 All dollar values in THOUSANDS (000s omitted) as presented in the document.
 If a value is not found or not clearly stated, return null.
 
+For every numeric value you extract, include the VERBATIM passage from the document (the exact sentence or table row) in the "citations" object. This is required for auditability — a human must be able to look up any number in the source PDF.
+- Keys in "citations" must match the field names exactly.
+- Values must be the verbatim text (max 300 chars). Include page context if available (e.g. table heading, note number).
+- Omit a key from "citations" if the corresponding metric is null.
+
 Return ONLY valid JSON matching this exact schema — no markdown, no explanation:
 {{
   "period_type": "annual or interim or unknown",
@@ -245,7 +320,12 @@ Return ONLY valid JSON matching this exact schema — no markdown, no explanatio
   "dscr": null,
   "going_concern_opinion": false,
   "going_concern_text": null,
-  "notes": "any important observations or caveats — always note if this is an interim filing and what period it covers"
+  "notes": "any important observations or caveats — always note if this is an interim filing and what period it covers",
+  "citations": {{
+    "total_revenue": "verbatim sentence or table row from document",
+    "net_income": "verbatim passage...",
+    "dscr": "verbatim passage..."
+  }}
 }}"""
 
 _HIGHER_ED_SUPPLEMENT = """
@@ -255,6 +335,8 @@ Also extract these higher education metrics into the SAME JSON object:
   "tuition_revenue": null,
   "tuition_discount_rate": null,
   "endowment_value": null
+
+Add verbatim citations for any of these fields you extract into the existing "citations" object.
 """
 
 _HEALTHCARE_SUPPLEMENT = """
@@ -265,6 +347,8 @@ Also extract these healthcare metrics into the SAME JSON object:
   "patient_days": null,
   "net_patient_revenue": null,
   "days_ar": null
+
+Add verbatim citations for any of these fields you extract into the existing "citations" object.
 """
 
 _EVENT_NOTICE_PROMPT = """\
@@ -362,7 +446,7 @@ def extract_financial_statement(
 
     response = client.messages.create(
         model=settings.extraction_model,
-        max_tokens=2048,
+        max_tokens=4096,  # citations add ~1-2k tokens to the response
         messages=[{"role": "user", "content": prompt}],
     )
     raw_json = response.content[0].text

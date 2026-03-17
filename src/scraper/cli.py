@@ -1118,6 +1118,105 @@ def cmd_parse_borrower(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Distress commands (Phase 5 — multi-signal scoring + timeline)
+# ---------------------------------------------------------------------------
+
+def cmd_distress_score(args: argparse.Namespace) -> int:
+    """
+    Compute and persist distress scores for all on-watchlist borrowers
+    (or a single borrower if --id is provided).
+
+    Scores aggregate: going concern, DSCR breach, late filing, negative
+    net assets, enrollment decline, and event notice signals.
+    """
+    from src.db.engine import Session
+    from src.distress.scoring import score_all_watchlist, update_borrower_score, compute_distress_score
+
+    borrower_id = getattr(args, "borrower_id", None)
+
+    with Session() as session:
+        if borrower_id:
+            score, bd = compute_distress_score(borrower_id, session)
+            update_borrower_score(borrower_id, session)
+            session.commit()
+
+            from src.db.repositories.borrower import BorrowerRepository
+            b = BorrowerRepository(session).get(borrower_id)
+            name = b.borrower_name if b else f"Borrower #{borrower_id}"
+            status = b.distress_status if b else "—"
+
+            print(f"\nDistress Score — {name}")
+            print("═" * 60)
+            print(f"  Score  : {score}/100")
+            print(f"  Status : {status}")
+            if bd.notes:
+                print(f"\n  Signal breakdown:")
+                for note in bd.notes:
+                    print(f"    • {note}")
+            print()
+        else:
+            print(f"\nDistress Scoring — All Watchlist Borrowers")
+            print("═" * 80)
+            results = score_all_watchlist(session)
+
+            print(f"\n  {'ID':>4}  {'Name':<42}  {'Score':>6}  Status")
+            print("  " + "-" * 68)
+
+            for bid, name, score, status, breakdown in results:
+                score_bar = "█" * (score // 10) + "░" * (10 - score // 10)
+                flag = "  ⚠" if status in ("distressed", "critical") else ""
+                print(
+                    f"  {bid:>4}  {name:<42.42}  {score:>5}/100  "
+                    f"{status}{flag}"
+                )
+                if breakdown:
+                    detail = "  +  ".join(f"{k}:+{v}" for k, v in breakdown.items())
+                    print(f"        {'':42}  [{detail}]")
+
+            print()
+            distressed = sum(1 for _, _, _, s, _ in results if s in ("distressed", "critical"))
+            watch = sum(1 for _, _, _, s, _ in results if s == "watch")
+            print(
+                f"  {len(results)} borrowers scored  |  "
+                f"{distressed} distressed/critical  |  {watch} watch"
+            )
+            print()
+
+    return 0
+
+
+def cmd_borrower_timeline(args: argparse.Namespace) -> int:
+    """
+    Show the full credit event timeline for a borrower — a chronological
+    history of distress signals, financial filing snapshots, and events.
+    """
+    from src.db.engine import Session
+    from src.db.repositories.borrower import BorrowerRepository
+    from src.distress.timeline import get_borrower_timeline, print_timeline
+
+    with Session() as session:
+        b = BorrowerRepository(session).get(args.borrower_id)
+        if not b:
+            print(f"Borrower #{args.borrower_id} not found.")
+            return 1
+
+        min_sev = getattr(args, "min_severity", None)
+        entries = get_borrower_timeline(
+            borrower_id=args.borrower_id,
+            session=session,
+            include_metrics=not getattr(args, "events_only", False),
+            min_severity=min_sev,
+        )
+        print_timeline(
+            borrower_name=b.borrower_name,
+            entries=entries,
+            show_urls=getattr(args, "show_urls", False),
+        )
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1418,6 +1517,51 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_bsync.set_defaults(func=cmd_borrower_sync)
+
+    # borrower timeline
+    p_btimeline = borrower_sub.add_parser(
+        "timeline",
+        help="Show chronological credit event timeline for one borrower",
+    )
+    p_btimeline.add_argument("borrower_id", type=int, help="Borrower ID")
+    p_btimeline.add_argument(
+        "--min-severity",
+        default=None,
+        choices=["monitor", "low", "medium", "high", "critical"],
+        help="Filter to events at or above this severity (default: all)",
+    )
+    p_btimeline.add_argument(
+        "--events-only",
+        action="store_true",
+        help="Show only distress events; exclude annual filing snapshots",
+    )
+    p_btimeline.add_argument(
+        "--show-urls",
+        action="store_true",
+        help="Print source PDF URLs under each entry",
+    )
+    p_btimeline.set_defaults(func=cmd_borrower_timeline)
+
+    # --- distress ---
+    p_distress = subparsers.add_parser(
+        "distress",
+        help="Distress scoring and credit event timeline (Phase 5)",
+    )
+    distress_sub = p_distress.add_subparsers(title="actions", metavar="ACTION")
+
+    # distress score
+    p_dscore = distress_sub.add_parser(
+        "score",
+        help="Compute and persist distress scores for all watchlist borrowers",
+    )
+    p_dscore.add_argument(
+        "--id",
+        dest="borrower_id",
+        type=int,
+        default=None,
+        help="Score a single borrower by ID (default: score all watchlist)",
+    )
+    p_dscore.set_defaults(func=cmd_distress_score)
 
     return parser
 

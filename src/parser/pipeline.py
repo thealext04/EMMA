@@ -43,6 +43,7 @@ from src.parser.extractor import (
     extract_financial_statement,
     extract_operating_report,
     has_going_concern_risk,
+    pre_scan_event_notice,
 )
 from src.parser.pdf_extractor import extract_from_url, extract_from_path
 
@@ -263,6 +264,21 @@ class ExtractionPipeline:
         doc.extracted_at = datetime.utcnow()
         self.db.commit()
 
+        # --- Step 6: Refresh distress score for this borrower ---
+        try:
+            from src.distress.scoring import update_borrower_score  # noqa: PLC0415
+            score, status = update_borrower_score(doc.borrower_id, self.db)
+            self.db.commit()
+            logger.debug(
+                "Distress score refreshed: borrower=%d score=%d status=%s",
+                doc.borrower_id, score, status,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not refresh distress score for borrower=%d: %s",
+                doc.borrower_id, exc,
+            )
+
         return "going_concern" if going_concern_flagged else "extracted"
 
     def _run_ai_extraction(
@@ -286,7 +302,7 @@ class ExtractionPipeline:
                 client=self.ai,
             )
 
-            # Write metrics to DB
+            # Write metrics to DB (with field-level citations for provenance)
             self.metrics_repo.upsert(
                 doc_id=doc.doc_id,
                 borrower_id=doc.borrower_id,
@@ -295,6 +311,7 @@ class ExtractionPipeline:
                 extraction_model=model,
                 extraction_confidence="medium",
                 raw_json=raw_json,
+                citations_json=_extract_citations_json(raw_json),
             )
 
             # Update doc's fiscal_year from extracted date
@@ -309,7 +326,30 @@ class ExtractionPipeline:
                 self._write_dscr_breach_event(doc, metrics)
 
         elif doc.doc_type == "event_notice":
+            # Fast keyword pre-scan before AI call — surfaces critical signals immediately
+            prescan_severity, prescan_keywords = pre_scan_event_notice(text)
+            if prescan_severity in ("critical", "high"):
+                logger.warning(
+                    "EVENT NOTICE pre-scan [%s] keywords=%s doc_id=%d borrower=%d",
+                    prescan_severity.upper(), prescan_keywords, doc.doc_id, doc.borrower_id,
+                )
+            elif prescan_severity == "medium":
+                logger.info(
+                    "Event notice pre-scan [medium] keywords=%s doc_id=%d",
+                    prescan_keywords, doc.doc_id,
+                )
+
             result, raw_json = extract_event_notice(text=text, client=self.ai)
+
+            # Elevate severity to pre-scan level if AI returned something lower
+            # (AI can be conservative; keyword matches are hard evidence)
+            _severity_rank = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+            if _severity_rank.get(prescan_severity, 0) > _severity_rank.get(result.severity, 1):
+                logger.info(
+                    "Elevating event notice severity %s → %s (keyword pre-scan)",
+                    result.severity, prescan_severity,
+                )
+                result.severity = prescan_severity
 
             # Write as a lightweight metrics record (just the event date + notes)
             placeholder = FinancialMetrics(
@@ -324,6 +364,7 @@ class ExtractionPipeline:
                 extraction_model=model,
                 extraction_confidence="high",
                 raw_json=raw_json,
+                citations_json="",  # event notices carry source in key_passage, not citations
             )
 
             # Write an event record for the material event
@@ -352,6 +393,7 @@ class ExtractionPipeline:
                 extraction_model=model,
                 extraction_confidence="medium",
                 raw_json=raw_json,
+                citations_json=_extract_citations_json(raw_json),
             )
 
         return "extracted"
@@ -499,3 +541,28 @@ def _parse_date(value) -> Optional[date]:
         return date_cls.fromisoformat(str(value)[:10])
     except (ValueError, TypeError):
         return None
+
+
+def _extract_citations_json(raw_json: str) -> str:
+    """
+    Pull the 'citations' dict out of a raw AI JSON response and return it
+    as a compact JSON string.  Returns "" if no citations key is present.
+
+    The citations dict maps metric field names to verbatim passages from the
+    source PDF, enabling field-level provenance: any number in extracted_metrics
+    can be traced back to the exact sentence or table row Claude read.
+
+    Handles both plain JSON and responses wrapped in markdown code fences.
+    """
+    from src.parser.extractor import _clean_json  # noqa: PLC0415
+    try:
+        data = json.loads(_clean_json(raw_json))
+        citations = data.get("citations")
+        if citations and isinstance(citations, dict):
+            # Keep only string values; drop nulls and non-strings
+            clean = {k: v for k, v in citations.items() if isinstance(v, str) and v.strip()}
+            if clean:
+                return json.dumps(clean, ensure_ascii=False)
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        pass
+    return ""
