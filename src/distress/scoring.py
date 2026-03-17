@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 # Event types that don't contribute to the "event_notice" signal bucket
 _NON_NOTICE_TYPES = frozenset({
     "late_filing", "going_concern", "dscr_breach", "financial_statement_filed",
+    "technical_default", "forbearance",  # scored via dedicated signals 7 & 8
 })
 
 
@@ -62,17 +63,21 @@ class ScoreBreakdown:
     negative_net_assets: int = 0
     enrollment_decline: int = 0
     event_notices: int = 0
+    technical_default: int = 0      # +35 pts — explicitly disclosed in financial statements
+    forbearance: int = 0            # +30 pts — active forbearance agreement disclosed
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, int]:
         return {
             k: v for k, v in {
-                "going_concern":      self.going_concern,
-                "dscr":               self.dscr,
-                "late_filing":        self.late_filing,
+                "going_concern":       self.going_concern,
+                "dscr":                self.dscr,
+                "late_filing":         self.late_filing,
                 "negative_net_assets": self.negative_net_assets,
-                "enrollment_decline": self.enrollment_decline,
-                "event_notices":      self.event_notices,
+                "enrollment_decline":  self.enrollment_decline,
+                "event_notices":       self.event_notices,
+                "technical_default":   self.technical_default,
+                "forbearance":         self.forbearance,
             }.items() if v > 0
         }
 
@@ -233,6 +238,28 @@ def compute_distress_score(borrower_id: int, session: Session) -> tuple[int, Sco
         )
 
     # ------------------------------------------------------------------
+    # Signal 7: Technical default (from extracted_metrics)
+    # A technical default is a direct legal covenant failure — scored at
+    # 35 pts (same as DSCR < 0.8, because both are active covenant breaches).
+    # ------------------------------------------------------------------
+    if latest_annual and latest_annual.technical_default:
+        bd.technical_default = 35
+        bd.notes.append(
+            f"Technical default disclosed in financials (FY{latest_annual.fiscal_year})"
+        )
+
+    # ------------------------------------------------------------------
+    # Signal 8: Forbearance agreement (from extracted_metrics)
+    # A forbearance means the lender has agreed not to accelerate — serious
+    # but lender is cooperating; scored at 30 pts.
+    # ------------------------------------------------------------------
+    if latest_annual and latest_annual.forbearance_agreement:
+        bd.forbearance = 30
+        bd.notes.append(
+            f"Active forbearance agreement disclosed (FY{latest_annual.fiscal_year})"
+        )
+
+    # ------------------------------------------------------------------
     # Total (capped)
     # ------------------------------------------------------------------
     bd.total = min(
@@ -242,7 +269,9 @@ def compute_distress_score(borrower_id: int, session: Session) -> tuple[int, Sco
         + bd.late_filing
         + bd.negative_net_assets
         + bd.enrollment_decline
-        + bd.event_notices,
+        + bd.event_notices
+        + bd.technical_default
+        + bd.forbearance,
     )
 
     logger.debug(

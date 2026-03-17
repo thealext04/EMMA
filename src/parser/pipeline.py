@@ -325,6 +325,12 @@ class ExtractionPipeline:
             if metrics.dscr is not None and metrics.dscr < 1.0:
                 self._write_dscr_breach_event(doc, metrics)
 
+            if metrics.technical_default:
+                self._write_technical_default_event(doc, metrics)
+
+            if metrics.forbearance_agreement:
+                self._write_forbearance_event(doc, metrics)
+
         elif doc.doc_type == "event_notice":
             # Fast keyword pre-scan before AI call — surfaces critical signals immediately
             prescan_severity, prescan_keywords = pre_scan_event_notice(text)
@@ -463,6 +469,69 @@ class ExtractionPipeline:
             logger.warning(
                 "DSCR BREACH EVENT written for borrower_id=%d doc_id=%d dscr=%.2f",
                 doc.borrower_id, doc.doc_id, dscr,
+            )
+
+    def _write_technical_default_event(self, doc: Document, metrics: FinancialMetrics) -> None:
+        """Write a technical_default Event if one doesn't already exist for this doc."""
+        event_date = metrics.fiscal_year_end or date.today()
+        existing = self.db.execute(
+            select(Event).where(
+                Event.borrower_id == doc.borrower_id,
+                Event.event_type == "technical_default",
+                Event.doc_id == doc.doc_id,
+            )
+        ).scalar_one_or_none()
+
+        if not existing:
+            event = Event(
+                borrower_id=doc.borrower_id,
+                doc_id=doc.doc_id,
+                event_type="technical_default",
+                event_date=event_date,
+                detected_date=date.today(),
+                severity="high",
+                summary=(
+                    metrics.forbearance_text
+                    or "Technical default or failure to pay interest disclosed in financial statements."
+                ),
+                confirmed=False,
+            )
+            self.db.add(event)
+            logger.warning(
+                "TECHNICAL DEFAULT EVENT written for borrower_id=%d doc_id=%d",
+                doc.borrower_id, doc.doc_id,
+            )
+
+    def _write_forbearance_event(self, doc: Document, metrics: FinancialMetrics) -> None:
+        """Write a forbearance Event if one doesn't already exist for this doc."""
+        event_date = metrics.fiscal_year_end or date.today()
+        existing = self.db.execute(
+            select(Event).where(
+                Event.borrower_id == doc.borrower_id,
+                Event.event_type == "forbearance",
+                Event.doc_id == doc.doc_id,
+            )
+        ).scalar_one_or_none()
+
+        if not existing:
+            event = Event(
+                borrower_id=doc.borrower_id,
+                doc_id=doc.doc_id,
+                event_type="forbearance",
+                event_date=event_date,
+                detected_date=date.today(),
+                severity="high",
+                summary=(
+                    metrics.forbearance_text
+                    or "Active forbearance agreement disclosed in financial statements."
+                ),
+                raw_text=metrics.forbearance_text,
+                confirmed=False,
+            )
+            self.db.add(event)
+            logger.warning(
+                "FORBEARANCE EVENT written for borrower_id=%d doc_id=%d",
+                doc.borrower_id, doc.doc_id,
             )
 
     def _write_event_notice_event(self, doc: Document, result: EventNoticeResult) -> None:

@@ -162,6 +162,12 @@ class FinancialMetrics(BaseModel):
     dscr: Optional[float] = None
     going_concern_opinion: bool = False
     going_concern_text: Optional[str] = None
+    credit_rating: Optional[str] = None           # e.g. "S&P: BBB+, Moody's: Baa2"
+    operating_expenses: Optional[float] = None    # total operating expenses, in thousands; flow — null for interim
+    interest_expense: Optional[float] = None      # interest expense line item, in thousands; flow — null for interim
+    technical_default: bool = False               # True ONLY if explicitly disclosed in document
+    forbearance_agreement: bool = False           # True ONLY if active forbearance explicitly disclosed
+    forbearance_text: Optional[str] = None        # verbatim description of forbearance terms from document
     notes: Optional[str] = None
 
     @field_validator("dscr")
@@ -183,7 +189,7 @@ class FinancialMetrics(BaseModel):
     @field_validator("total_revenue", "operating_revenue", "net_income",
                      "operating_income", "ebitda", "cash_and_investments",
                      "unrestricted_net_assets", "total_long_term_debt",
-                     "annual_debt_service")
+                     "annual_debt_service", "operating_expenses", "interest_expense")
     @classmethod
     def dollar_reasonable(cls, v: Optional[float]) -> Optional[float]:
         # Reject values that are clearly wrong orders of magnitude
@@ -201,6 +207,7 @@ class HigherEdMetrics(BaseModel):
     tuition_revenue: Optional[float] = None          # in thousands
     tuition_discount_rate: Optional[float] = None    # 0.0–1.0 (e.g. 0.45 = 45%)
     endowment_value: Optional[float] = None          # in thousands
+    gift_revenue: Optional[float] = None             # contributions and donations, in thousands; flow — null for interim
 
     @field_validator("tuition_discount_rate")
     @classmethod
@@ -231,6 +238,7 @@ class HealthcareMetrics(BaseModel):
     patient_days: Optional[int] = None
     net_patient_revenue: Optional[float] = None      # in thousands
     days_ar: Optional[float] = None                  # days in accounts receivable
+    municipal_debt: Optional[float] = None           # municipal bond debt outstanding, in thousands (balance sheet)
 
     @field_validator("days_ar")
     @classmethod
@@ -290,8 +298,13 @@ FIRST, determine the reporting period:
 
 IMPORTANT RULES FOR FLOW METRICS (revenue, income, EBITDA):
 - If period_type is "annual": extract all metrics normally.
-- If period_type is "interim": set total_revenue, operating_revenue, net_income, operating_income, ebitda, tuition_revenue, and net_patient_revenue to null. DO NOT annualize or extrapolate.
-- Balance sheet / snapshot metrics (cash, debt, net assets, enrollment, endowment, beds, DSCR, days cash) are point-in-time and should ALWAYS be extracted regardless of period type.
+- If period_type is "interim": set total_revenue, operating_revenue, net_income, operating_income, ebitda, operating_expenses, interest_expense, gift_revenue, tuition_revenue, and net_patient_revenue to null. DO NOT annualize or extrapolate.
+- Balance sheet / snapshot metrics (cash, debt, net assets, enrollment, endowment, beds, DSCR, days cash, municipal_debt) are point-in-time and should ALWAYS be extracted regardless of period type.
+
+BOOLEAN FLAG RULES:
+- "technical_default": true ONLY if the document explicitly states a technical default, failure to pay interest, or payment default. Do NOT infer from DSCR or cash levels alone.
+- "forbearance_agreement": true ONLY if the document explicitly discloses an active forbearance agreement with a lender or trustee. Do NOT infer.
+- "credit_rating": report the most recent rating found in this document, including agency name prefix. Example: "S&P: BBB+, Moody's: Baa2". If ratings from multiple agencies are present, include all. Return null if no rating is stated in this document.
 
 All dollar values in THOUSANDS (000s omitted) as presented in the document.
 If a value is not found or not clearly stated, return null.
@@ -320,11 +333,21 @@ Return ONLY valid JSON matching this exact schema — no markdown, no explanatio
   "dscr": null,
   "going_concern_opinion": false,
   "going_concern_text": null,
+  "credit_rating": null,
+  "operating_expenses": null,
+  "interest_expense": null,
+  "technical_default": false,
+  "forbearance_agreement": false,
+  "forbearance_text": null,
   "notes": "any important observations or caveats — always note if this is an interim filing and what period it covers",
   "citations": {{
     "total_revenue": "verbatim sentence or table row from document",
     "net_income": "verbatim passage...",
-    "dscr": "verbatim passage..."
+    "dscr": "verbatim passage...",
+    "credit_rating": "verbatim sentence stating the rating",
+    "operating_expenses": "verbatim passage...",
+    "interest_expense": "verbatim passage...",
+    "forbearance_text": "verbatim passage describing forbearance terms"
   }}
 }}"""
 
@@ -334,7 +357,10 @@ Also extract these higher education metrics into the SAME JSON object:
   "fte_enrollment": null,
   "tuition_revenue": null,
   "tuition_discount_rate": null,
-  "endowment_value": null
+  "endowment_value": null,
+  "gift_revenue": null
+
+gift_revenue = total contributions and donations received (gifts, grants, and pledges). Null for interim filings.
 
 Add verbatim citations for any of these fields you extract into the existing "citations" object.
 """
@@ -346,7 +372,10 @@ Also extract these healthcare metrics into the SAME JSON object:
   "patient_admissions": null,
   "patient_days": null,
   "net_patient_revenue": null,
-  "days_ar": null
+  "days_ar": null,
+  "municipal_debt": null
+
+municipal_debt = the outstanding principal balance of municipal bond debt only (tax-exempt revenue bonds, GO bonds, etc.). This is a balance sheet item — extract for both annual and interim. Null if not separately identified.
 
 Add verbatim citations for any of these fields you extract into the existing "citations" object.
 """
@@ -446,7 +475,7 @@ def extract_financial_statement(
 
     response = client.messages.create(
         model=settings.extraction_model,
-        max_tokens=4096,  # citations add ~1-2k tokens to the response
+        max_tokens=6000,  # citations + new MVP fields add ~2-3k tokens to the response
         messages=[{"role": "user", "content": prompt}],
     )
     raw_json = response.content[0].text

@@ -164,6 +164,18 @@ class MetricsRepository:
         _set("annual_debt_service",     metrics.annual_debt_service)
         _set("dscr",                    metrics.dscr)
 
+        # MVP additions — Phase 5.1 (cross-sector)
+        # credit_rating: store latest rating found; in merge_mode existing wins
+        _set("credit_rating",         metrics.credit_rating)
+        # Flow metrics — Claude nulls these for interim filings
+        _set("operating_expenses",    metrics.operating_expenses)
+        _set("interest_expense",      metrics.interest_expense)
+        # Boolean flags: convert Pydantic default False → None (DB NULL = not extracted)
+        # so merge_mode doesn't overwrite a True from a prior doc with a False from a thinner one
+        _set("technical_default",     metrics.technical_default or None)
+        _set("forbearance_agreement", metrics.forbearance_agreement or None)
+        _set("forbearance_text",      metrics.forbearance_text)
+
         # --- Sector-specific metrics ---
         if sector_metrics is not None:
             from src.parser.extractor import HigherEdMetrics, HealthcareMetrics  # noqa: PLC0415
@@ -174,14 +186,16 @@ class MetricsRepository:
                 _set("tuition_revenue",       sector_metrics.tuition_revenue)
                 _set("tuition_discount_rate", sector_metrics.tuition_discount_rate)
                 _set("endowment_value",       sector_metrics.endowment_value)
+                _set("gift_revenue",          sector_metrics.gift_revenue)
 
             elif isinstance(sector_metrics, HealthcareMetrics):
                 _set("licensed_beds",       sector_metrics.licensed_beds)
                 _set("staffed_beds",        sector_metrics.staffed_beds)
                 _set("patient_admissions",  sector_metrics.patient_admissions)
                 _set("patient_days",        sector_metrics.patient_days)
-                record.net_patient_revenue = sector_metrics.net_patient_revenue
-                record.days_ar            = sector_metrics.days_ar
+                _set("net_patient_revenue", sector_metrics.net_patient_revenue)   # fixed: was bypassing _set()
+                _set("days_ar",             sector_metrics.days_ar)               # fixed: was bypassing _set()
+                _set("municipal_debt",      sector_metrics.municipal_debt)
 
         # --- Extraction metadata ---
         record.extraction_model      = extraction_model

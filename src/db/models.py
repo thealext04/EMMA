@@ -325,6 +325,16 @@ class ExtractedMetrics(Base):
     net_patient_revenue     = Column(Numeric(18, 2))
     days_ar                 = Column(Numeric(8, 2))
 
+    # MVP additions — Phase 5.1 (cross-sector and sector-specific)
+    credit_rating           = Column(Text)                  # e.g. "S&P: BBB+, Moody's: Baa2"
+    operating_expenses      = Column(Numeric(18, 2))        # flow metric — null for interim
+    interest_expense        = Column(Numeric(18, 2))        # flow metric — null for interim
+    technical_default       = Column(Boolean)               # NULL=not extracted, True=confirmed
+    forbearance_agreement   = Column(Boolean)               # NULL=not extracted, True=confirmed
+    forbearance_text        = Column(Text)                  # verbatim description from doc
+    gift_revenue            = Column(Numeric(18, 2))        # higher ed: donations/contributions, flow
+    municipal_debt          = Column(Numeric(18, 2))        # healthcare: muni bond debt, balance sheet
+
     # Period context — critical for comparing figures across documents
     period_type             = Column(Text)          # 'annual' | 'interim' | 'unknown'
     period_months           = Column(Integer)       # months covered: 12=annual, 6=semi-annual, 3=quarterly
