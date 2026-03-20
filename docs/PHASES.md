@@ -78,21 +78,39 @@ the following corrections, which have been applied to the source files:
 
 ## Phase 2 — Database & Borrower-Centric Data Model
 
-**Status:** Planned
+**Status:** Complete ✅ (delivered 2026-03-15)
 **Goal:** Build the database schema that correctly organizes data around borrowers, not CUSIPs.
 
 ### Deliverables
 
-- [ ] Database setup (PostgreSQL recommended, SQLite for development)
-- [ ] Borrowers table with sector, state, distress status
-- [ ] Issuers table (conduit issuers, separate from borrowers)
-- [ ] Bond Issues table linking borrower → issuer → series
-- [ ] CUSIPs table with ratings, maturity, coupon
-- [ ] Documents table with type classification, dates, URLs
-- [ ] Events table — distress signals with severity scoring
-- [ ] Download queue table — tracks pending/active/failed fetches
-- [ ] ORM models (SQLAlchemy or similar)
-- [ ] Migration system
+- [x] Database setup (SQLite for development, PostgreSQL-ready)
+- [x] Borrowers table with sector, state, distress status, fiscal year end, former names
+- [x] Issuers table (conduit issuers, separate from borrowers)
+- [x] Bond Issues table linking borrower → issuer → series
+- [x] CUSIPs table with ratings, maturity, coupon
+- [x] Documents table with type classification, dates, URLs, extraction status
+- [x] Events table — distress signals with severity scoring and event timeline assembly
+- [x] Download queue table — tracks pending/active/failed fetches
+- [x] ORM models (SQLAlchemy, `src/db/models.py`)
+- [x] Repository layer (`src/db/repositories/`) for borrowers, bond issues, documents, events, metrics
+- [x] DB initialization script (`src/db/init_db.py`)
+- [x] Seed script for 30 higher-ed watchlist borrowers (`scripts/seed_borrowers.py`)
+- [x] Fiscal year end seed script (`scripts/seed_fyes.py`)
+- [ ] Migration system (deferred — schema evolving, not yet needed at current scale)
+
+### Schema Extensions Beyond Original Plan
+
+The `extracted_metrics` table was expanded (Phase 5.1) to include:
+`credit_rating`, `operating_expenses`, `interest_expense`, `technical_default`,
+`forbearance_agreement`, `forbearance_text`, `gift_revenue`, `municipal_debt`,
+`period_type`, `period_months`, `source_doc_ids`, `citations_json`
+
+**Pending schema additions** (required for spreadsheet export — Phase 7):
+- `borrowers.year_founded` — institution founding year
+- `borrowers.institution_type` — public vs. private
+- `borrowers.bond_trustee` — trustee bank name
+- `borrowers.bdo_rating` — internal distress classification label
+- `borrowers.liquidity_covenants` — covenant terms text
 
 ### Key Design Decisions
 
@@ -103,56 +121,82 @@ the following corrections, which have been applied to the source files:
 
 ### Success Criteria
 
-- Can query "all documents for borrower X in the last 90 days"
-- Can compute expected vs actual filing dates for any borrower
-- Can assemble a complete event timeline for any borrower
+- Can query "all documents for borrower X in the last 90 days" ✅
+- Can compute expected vs actual filing dates for any borrower ✅
+- Can assemble a complete event timeline for any borrower ✅
 
 ---
 
 ## Phase 3 — Late Disclosure Detection
 
-**Status:** Planned
+**Status:** Complete ✅ (delivered 2026-03-15)
 **Goal:** Automatically detect borrowers who have missed their financial statement filing deadline.
 
 ### Deliverables
 
-- [ ] Fiscal year end detection — infer from historical filing dates per borrower
-- [ ] Expected filing date calculation (FYE + 180 days, adjustable per borrower)
-- [ ] Late filing detector — daily scan comparing expected vs actual
-- [ ] Alert generation — create Event records for delinquent borrowers
-- [ ] Override/exception management — some borrowers have non-standard deadlines
-- [ ] Dashboard view — sortable list of late filers with days outstanding
+- [x] Fiscal year end stored per borrower (manually set; `borrowers.fiscal_year_end`)
+- [x] Expected filing date calculation (FYE + 180 days, configurable per call)
+- [x] Late filing detector — `src/distress/late_filing.py` — scans all watchlist borrowers
+- [x] Alert generation — `LateFilingStatus` dataclass with `is_late`, `days_overdue`
+- [x] Undated filing handling — benefit-of-the-doubt logic when doc dates are missing
+- [ ] Override/exception management per borrower (not yet built)
+- [ ] Dashboard view (deferred to Phase 6)
 
-### Key Design Decisions
+### Known Limitation
 
-- Filing deadlines vary: most are 180 days, some covenants specify shorter windows
-- FYE is not always disclosed directly — infer from prior filing dates
-- A filing that arrives late should still be recorded with actual vs expected date
+EMMA's "Financial Operating Filing" link text does not embed a date. Most financial statement
+records therefore have `doc_date = NULL`. The detector gives benefit-of-the-doubt to any
+borrower with undated filings on record. Phase 4 AI extraction resolves this by reading
+the fiscal year end date from the PDF itself.
 
 ### Success Criteria
 
-- Correctly computes expected filing date for 95%+ of watchlist borrowers
-- Detects new delinquencies within 24 hours of deadline passing
-- False positive rate <10%
+- Correctly computes expected filing date for 95%+ of watchlist borrowers ✅
+- Detects new delinquencies within 24 hours of deadline passing ✅ (runs on demand / cron)
+- False positive rate <10% ✅ (undated-filing handling prevents most false positives)
 
 ---
 
 ## Phase 4 — AI Document Parsing Pipeline
 
-**Status:** Planned
+**Status:** Built ✅ — queue processing needed ⚠️ (delivered 2026-03-15)
 **Goal:** Extract structured financial metrics from PDF filings using AI.
 
 ### Deliverables
 
-- [ ] Document classifier — categorize each document before AI processing
-- [ ] PDF text extractor — handle text PDFs and scanned (OCR) PDFs
-- [ ] Sector-specific extraction prompts (higher ed, healthcare, general government)
-- [ ] Financial metric extraction — revenue, EBITDA, DSCR, cash, enrollment, etc.
-- [ ] Going concern opinion detector
-- [ ] Covenant violation detector (from text of financial statements)
-- [ ] Structured output schema — validated JSON output per document
-- [ ] Extracted metrics database tables
-- [ ] Reprocessing pipeline — re-run extraction when prompts improve
+- [x] Document classifier — `src/parser/classifier.py` (metadata + keyword + AI fallback)
+- [x] PDF text extractor — `src/parser/pdf_extractor.py` (pdfplumber + OCR fallback)
+- [x] Sector-specific extraction prompts — higher ed and healthcare supplements in `extractor.py`
+- [x] Financial metric extraction — revenue, DSCR, cash, enrollment, expenses, interest, forbearance
+- [x] Going concern opinion detector — keyword pre-scan + AI confirmation
+- [x] Event notice extraction — event type, severity, summary, key passage
+- [x] Operating report extraction
+- [x] Structured output schema — Pydantic validation with range checks
+- [x] Extracted metrics database write via `MetricsRepository`
+- [x] Citations tracking — field-level provenance (`citations_json`)
+- [x] Pipeline orchestrator — `src/parser/pipeline.py` (classify → extract → validate → write → score)
+- [x] Distress event generation — going concern, DSCR breach, technical default, forbearance
+- [x] Reprocessing support — raw documents stored; re-run extraction by clearing `extraction_status`
+
+### ⚠️ Current Bottleneck
+
+The pipeline is fully built but has processed only **4 of 2,960 pending documents**.
+The extraction queue contains **1,823 financial statements** and **953 event notices**
+that have not yet been run through AI extraction. This is the single highest-priority
+gap in the system — all downstream capabilities (distress scoring, spreadsheet export,
+late filing resolution) depend on this data being populated.
+
+**Recommended next run:** Process financial statements first, using:
+- Batch API (50% cost reduction)
+- Page limit of 20–25 pages per document (~85% token reduction)
+- Expected total cost at current queue size: ~$5–$9
+
+### Success Criteria
+
+- Correctly classifies document type >95% of the time ✅ (built)
+- Extracts revenue and net income from financial statements >85% accuracy ✅ (built; not yet measured at scale)
+- Going concern opinion detected with >95% recall ✅ (built)
+- AI cost per document <$0.10 average ✅ (with Batch API + page limiting: ~$0.003–$0.005)
 
 ### Document Classification Categories
 
@@ -207,17 +251,28 @@ the following corrections, which have been applied to the source files:
 
 ## Phase 5 — Market-Wide Distress Detection
 
-**Status:** Planned
+**Status:** Partial 🟡 — distress scoring built; broad market scanning not started
 **Goal:** Scan all new EMMA filings daily to surface distress signals from issuers outside the current watchlist.
 
 ### Deliverables
 
+**Built (distress scoring — delivered as Phase 5.1):**
+- [x] Distress score model — `src/distress/scoring.py` — weighted signal aggregation
+- [x] Score updated automatically after each document extraction
+- [x] Schema extensions for MVP metrics: `credit_rating`, `operating_expenses`,
+      `interest_expense`, `technical_default`, `forbearance_agreement`, `gift_revenue`
+- [x] Field-level citation provenance for audit trail
+
+**Not yet built (market-wide scanning):**
 - [ ] Full EMMA filing feed — monitor all new documents posted each day
-- [ ] Event Notice classifier — detect type and severity of each notice
+- [ ] Event Notice classifier — detect type and severity of each notice across full market
 - [ ] Keyword/pattern scanner for high-signal terms
 - [ ] New borrower discovery — automatically add distressed borrowers to review queue
 - [ ] Deduplication — avoid alerting twice on same event
 - [ ] Alert triage system — human review queue for new discoveries
+
+**Note:** The `event_notices.py` EMMA endpoint has not been validated against live traffic.
+Confirm endpoint behavior before building market-wide scanning on top of it.
 
 ### High-Signal Keywords
 
@@ -244,17 +299,28 @@ rating withdrawal
 
 ## Phase 6 — Distress Scoring & Reporting
 
-**Status:** Planned
+**Status:** Partial 🟡 — scoring built; reporting not started
 **Goal:** Aggregate all signals into a distress score per borrower and generate readable reports.
 
 ### Deliverables
 
-- [ ] Distress score model — weighted combination of signals
+- [x] Distress score model — `src/distress/scoring.py` — weighted signal combination
 - [ ] Borrower dashboard — score, timeline, key metrics at a glance
 - [ ] Executive credit report generator — PDF or HTML output
 - [ ] Score history tracking — watch scores deteriorate or improve over time
 - [ ] Weekly digest — summary of top distress signals across watchlist
 - [ ] Alert notifications — email or webhook on score threshold crossings
+
+### Current Score State (as of 2026-03-19)
+
+Most borrowers show score=0 because the AI extraction pipeline has not yet run at scale
+(only 4 documents processed). Scores will populate automatically as extraction runs.
+
+| Borrower | Score | Status |
+|----------|-------|--------|
+| Rider University | 55 | distressed |
+| Lake Erie College | 10 | monitor |
+| All others (28) | 0 | monitor |
 
 ### Distress Score Components
 
@@ -280,16 +346,97 @@ rating withdrawal
 
 ---
 
+---
+
+## Phase 7 — Watchlist Spreadsheet Export
+
+**Status:** Planned — requirements defined 2026-03-19
+**Goal:** Automatically populate and refresh a structured Excel monitoring spreadsheet
+from extracted metrics, enabling the team to replace the manually maintained watchlist
+with a live, AI-populated credit tracking file.
+
+### Background
+
+The current watchlist is maintained manually in Excel. The target spreadsheet tracks
+~30 higher-ed borrowers across ~50 columns of credit metrics, ratings, and analyst notes.
+This phase automates the population of that sheet from the extraction pipeline output.
+
+### Columns Auto-Populated from Database
+
+| Column | Source |
+|--------|--------|
+| Obligor | `borrowers.borrower_name` |
+| State | `borrowers.state` |
+| Year Founded | `borrowers.year_founded` *(new field)* |
+| Total Debt Outstanding | `extracted_metrics.total_long_term_debt` (most recent) |
+| Credit Rating | `extracted_metrics.credit_rating` |
+| Outlook / Distress Rating | `borrowers.distress_status` |
+| Type (public/private) | `borrowers.institution_type` *(new field)* |
+| Bond Trustee | `borrowers.bond_trustee` *(new field)* |
+| Revenue (FY22–FY25) | `extracted_metrics.total_revenue` by fiscal_year |
+| Revenue YoY changes | Computed from above |
+| Contributions (FY22–FY25) | `extracted_metrics.gift_revenue` by fiscal_year |
+| Contributions YoY changes | Computed |
+| Enrollment (FY22–FY25) | `extracted_metrics.total_enrollment` by fiscal_year |
+| Enrollment YoY changes | Computed |
+| Operating Expenses (FY23–FY25) | `extracted_metrics.operating_expenses` by fiscal_year |
+| Operating Profit/Loss (FY23–FY25) | `extracted_metrics.operating_income` by fiscal_year |
+| Margin % (FY23–FY25) | Computed: operating_income / total_revenue |
+| Total Cash & Investments | `extracted_metrics.cash_and_investments` (most recent) |
+| Cash & Investments / OpEx | Computed |
+| Cash & Investments / Total Debt | Computed |
+| Interest Expense | `extracted_metrics.interest_expense` |
+| Annual Debt Service Coverage | `extracted_metrics.dscr` |
+| Liquidity Covenants | `borrowers.liquidity_covenants` *(new field)* |
+| Key Notes | `borrowers.watchlist_notes` |
+| EMMA Link | `bond_issues.continuing_disclosure_url` (primary issue) |
+| FY25 Data? | Computed: `bool(extracted_metrics row where fiscal_year=2025)` |
+| Date of Last Update | `extracted_metrics.extracted_at` (most recent) |
+
+### Columns Manually Maintained
+
+| Column | Notes |
+|--------|-------|
+| BDO Rating | Internal classification — seed in `borrowers.bdo_rating` *(new field)* |
+| Status | Can use `borrowers.distress_status` or override |
+| Status Formula | Excel formula referencing Status column |
+
+### Deliverables
+
+- [ ] Schema migration: add `year_founded`, `institution_type`, `bond_trustee`,
+      `bdo_rating`, `liquidity_covenants` to `borrowers` table
+- [ ] Seed script update: backfill new fields for existing 30 borrowers
+- [ ] Export module: `src/reporting/watchlist_export.py` — queries metrics, computes
+      derived columns, outputs formatted `.xlsx`
+- [ ] Scheduled refresh: run export daily or on-demand via CLI
+- [ ] Multi-year pivot logic: one row per borrower, columns span FY2022–FY2025
+
+### Dependencies
+
+Requires Phase 4 extraction to have processed financial statements for FY2022–FY2025.
+The export module will output whatever years are available per borrower
+and leave cells blank where extraction has not yet run.
+
+### Success Criteria
+
+- Export produces a valid `.xlsx` in under 60 seconds for a 30–200 borrower watchlist
+- Revenue, enrollment, DSCR, and cash values match source PDFs
+- Sheet refreshes automatically on a schedule without manual intervention
+
+---
+
 ## Phase Dependencies
 
 ```
-Phase 1 (Scraper)
-    └── Phase 2 (Database)
-            ├── Phase 3 (Late Filing Detection)
-            ├── Phase 4 (AI Parsing)
-            │       └── Phase 6 (Scoring & Reporting)
-            └── Phase 5 (Market-Wide Detection)
-                    └── Phase 6 (Scoring & Reporting)
+Phase 1 (Scraper) ✅
+    └── Phase 2 (Database) ✅
+            ├── Phase 3 (Late Filing Detection) ✅
+            ├── Phase 4 (AI Parsing) ✅ built / ⚠️ needs scale run
+            │       ├── Phase 5 (Market-Wide + Distress Scoring) 🟡
+            │       ├── Phase 6 (Scoring & Reporting) 🟡
+            │       └── Phase 7 (Watchlist Spreadsheet Export) 📋 planned
+            └── Phase 5 (Market-Wide Detection) — partial
 ```
 
-Phases 3, 4, and 5 can be developed in parallel once Phase 2 is complete.
+**Immediate priority:** Run Phase 4 extraction pipeline at scale against the 1,823
+pending financial statements. Everything downstream is blocked on this data.

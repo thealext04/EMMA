@@ -14,15 +14,32 @@ This is NOT a bond data scraper. It is a credit intelligence platform organized 
 
 ## Current Phase
 
-**Phase 1 — EMMA Scraping & Discovery Engine**
+**Phase 4 scale-up → Phase 7 Watchlist Spreadsheet Export**
 
-The immediate goal is building a reliable, respectful scraper that can:
-1. Discover bond issues by borrower/issuer name
-2. Fetch continuing disclosure document lists for tracked issues
-3. Queue and download PDFs
-4. Track incremental updates (only fetch new documents)
+Phases 1–3 are complete. Phase 4 (AI parsing) is fully built but has processed only
+4 of 2,960 pending documents. The immediate priorities in order are:
 
-See [docs/PHASES.md](docs/PHASES.md) for the full roadmap.
+1. **Run Phase 4 extraction at scale** — 1,823 financial statements are pending.
+   Use Batch API + 20-page limit to keep cost to ~$5–$9 for the full backlog.
+2. **Add Phase 7 schema fields** to the `borrowers` table:
+   `year_founded`, `institution_type`, `bond_trustee`, `bdo_rating`, `liquidity_covenants`
+3. **Build `src/reporting/watchlist_export.py`** — the spreadsheet auto-population module
+   that reads extracted metrics and outputs a formatted `.xlsx` watchlist.
+
+See [docs/PHASES.md](docs/PHASES.md) for detailed phase statuses and the full roadmap.
+
+### Live Database State (as of 2026-03-19)
+
+| Entity | Count |
+|--------|-------|
+| Borrowers (all `higher_ed`) | 30 |
+| Bond Issues | 200 |
+| Documents discovered | 2,964 |
+| Financial statements (pending extraction) | 1,823 |
+| Event notices (pending extraction) | 953 |
+| Documents extracted via AI | 4 |
+| Distress events logged | 3 |
+| Borrowers with non-zero distress score | 2 (Rider=55, Lake Erie=10) |
 
 ---
 
@@ -54,17 +71,29 @@ All requests must use realistic Chrome User-Agent headers and `requests.Session(
 | Path | Description |
 |------|-------------|
 | `docs/PROJECT_OVERVIEW.md` | Full project context |
-| `docs/PHASES.md` | Phase-by-phase build plan |
+| `docs/PHASES.md` | Phase-by-phase build plan with current statuses |
 | `docs/ARCHITECTURE.md` | System architecture |
 | `docs/DATABASE_SCHEMA.md` | Database tables and SQL |
-| `docs/EMMA_ENDPOINTS.md` | EMMA API endpoints reference |
+| `docs/EMMA_ENDPOINTS.md` | EMMA API endpoints reference (live-tested corrections) |
 | `docs/SCRAPING_STRATEGY.md` | Rate limits, retry, caching |
-| `docs/AI_PARSING.md` | AI extraction pipeline |
-| `src/scraper/` | Phase 1 scraping code |
-| `src/db/` | Database models |
-| `src/monitor/` | Disclosure monitoring |
-| `src/parser/` | AI document parsing |
-| `src/distress/` | Distress detection and scoring |
+| `docs/AI_PARSING.md` | AI extraction pipeline and cost optimization |
+| `src/scraper/` | Phase 1 — discovery engine (complete) |
+| `src/db/models.py` | SQLAlchemy ORM — all tables |
+| `src/db/repositories/` | Repository layer per entity |
+| `src/parser/pipeline.py` | Phase 4 — AI extraction orchestrator |
+| `src/parser/extractor.py` | Claude API extraction functions |
+| `src/parser/classifier.py` | Document type classifier |
+| `src/parser/pdf_extractor.py` | PDF → text (pdfplumber + OCR) |
+| `src/distress/late_filing.py` | Phase 3 — late filing detector |
+| `src/distress/scoring.py` | Phase 5/6 — distress score model |
+| `src/monitor/` | Phase 5 — market-wide monitoring (not yet built) |
+| `src/reporting/` | Phase 7 — spreadsheet export (not yet built) |
+| `scripts/seed_borrowers.py` | Seeds 30 higher-ed watchlist borrowers |
+| `scripts/seed_fyes.py` | Fiscal year end backfill |
+| `scripts/fix_sync_data.py` | One-time data repair utility |
+| `data/emma.db` | Live SQLite database |
+| `data/raw_documents/` | Downloaded PDFs (by year/month/borrower) |
+| `data/queue/queue.json` | JSON-backed download queue (Phase 2 migrates to DB) |
 
 ---
 
@@ -110,10 +139,19 @@ Do not exceed these. EMMA is a public service and we want to remain a respectful
 
 ## What the Existing Code Does
 
-- `emma_issuer.py` — Early prototype. Given a CUSIP, looks up the issuer name via EMMA QuickSearch. Uses `requests.Session()` and browser-like headers. **Not production-ready** — hardcoded session cookies.
-- `main.py` — Stub/test file from early exploration.
+### Production Code (use and extend these)
 
-These files are reference material. Do not build Phase 1 on top of them directly — start fresh in `src/scraper/`.
+- `src/scraper/` — Full Phase 1 discovery engine. Finds bond issues, discovers documents, downloads PDFs, manages rate limits and retries. Entry point: `src/scraper/cli.py`.
+- `src/db/` — Complete database layer. Models, engine, repositories for all entities.
+- `src/parser/pipeline.py` — Phase 4 AI extraction orchestrator. Run this against the queue.
+- `src/parser/extractor.py` — Claude API extraction (financial statements, event notices, operating reports).
+- `src/distress/late_filing.py` — Phase 3 late filing detector. Schedule daily.
+- `src/distress/scoring.py` — Distress score model. Called automatically by the pipeline.
+
+### Reference Material Only (do not extend)
+
+- `emma_issuer.py` — Early prototype with hardcoded session cookies. Superseded by `src/scraper/session.py`.
+- `main.py` — Stub/test file from early exploration.
 
 ---
 

@@ -60,7 +60,7 @@ Most EMMA tools track data at the issuer or CUSIP level. This fundamentally misi
 
 ---
 
-## Three Monitoring Modules
+## Four Monitoring Modules
 
 ### Module 1 — Watchlist Monitoring
 
@@ -117,6 +117,19 @@ The system scans all new EMMA filings (500–2,000/day) for distress signals:
 
 When a new signal is detected, the borrower is surfaced for watchlist consideration.
 
+### Module 4 — Watchlist Spreadsheet Export (Phase 7)
+
+A structured Excel output that auto-populates from extracted metrics, replacing the
+manually maintained credit tracking spreadsheet. One row per borrower, columns spanning
+FY2022–FY2025 for key financial metrics, with computed YoY change columns.
+
+Key fields auto-populated: revenue, contributions/gifts, enrollment, operating expenses,
+operating profit/loss, margins, total cash & investments, coverage ratios, DSCR, credit
+rating, distress status, EMMA link, and last-updated timestamp.
+
+The export is scheduled to refresh automatically. Analyst-curated fields (BDO rating,
+key notes, liquidity covenant terms) are maintained in the database and merged at export time.
+
 ---
 
 ## Competitive Differentiation
@@ -135,6 +148,7 @@ This system is a **municipal distress intelligence platform**:
 | Distress risk scoring | No | Yes |
 | Market-wide signal detection | No | Yes |
 | Watchlist management | No | Yes |
+| Automated spreadsheet reporting | No | Yes (Phase 7) |
 
 ---
 
